@@ -1,10 +1,16 @@
 import express from "express";
 import cors from "cors";
-import helmet from "helmet";
+import helmetDefault from "helmet";
 import { config } from "./config.js";
 import { connectDb } from "./db.js";
 import { registerRoutes } from "./routes.js";
 import { registerCheckoutRoutes, registerStripeWebhook } from "./stripeRoutes.js";
+
+type HelmetMiddleware = (
+  options?: { crossOriginResourcePolicy?: { policy: "cross-origin" | "same-origin" | "same-site" } }
+) => (req: express.Request, res: express.Response, next: express.NextFunction) => void;
+
+const helmet = helmetDefault as unknown as HelmetMiddleware;
 
 const app = express();
 
