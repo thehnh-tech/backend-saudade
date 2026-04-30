@@ -67,7 +67,7 @@ export function registerStripeWebhook(app: Express) {
         customerEmail: session.customer_details?.email ?? session.customer_email ?? null,
         amountTotal: session.amount_total ?? 0,
         currency: session.currency ?? "eur",
-        status: "paid",
+        status: "paid" as const,
         lineItems: [{
           productId: session.metadata?.productId ?? "unknown",
           title: session.metadata?.title ?? "SAUDADE item",
