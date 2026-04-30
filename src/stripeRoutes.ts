@@ -1,5 +1,4 @@
 import express, { type Express } from "express";
-import Stripe from "stripe";
 import { z } from "zod";
 import { requireRole } from "./auth.js";
 import { config } from "./config.js";
@@ -51,7 +50,8 @@ export function registerStripeWebhook(app: Express) {
     const signature = req.headers["stripe-signature"];
     if (!signature) return res.status(400).json({ error: "MISSING_STRIPE_SIGNATURE" });
 
-    let event: Stripe.Event;
+    type StripeEvent = ReturnType<NonNullable<typeof stripe>["webhooks"]["constructEvent"]>;
+    let event: StripeEvent;
     try {
       event = stripe.webhooks.constructEvent(req.body, signature, config.stripeWebhookSecret);
     } catch (err) {
@@ -60,7 +60,7 @@ export function registerStripeWebhook(app: Express) {
     }
 
     if (event.type === "checkout.session.completed") {
-      const session = event.data.object as Stripe.Checkout.Session;
+      const session = event.data.object as Extract<StripeEvent, { type: "checkout.session.completed" }>["data"]["object"];
       const now = nowIso();
       const orderPayload = {
         stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
