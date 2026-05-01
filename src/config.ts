@@ -1,10 +1,6 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 
 dotenv.config();
-
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 export const config = {
   port: Number(process.env.PORT ?? 4000),
@@ -17,12 +13,12 @@ export const config = {
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? "",
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
   marketplacePublicUrl: process.env.MARKETPLACE_PUBLIC_URL ?? "http://localhost:3000",
+  cloudinaryCloudName: process.env.CLOUDINARY_CLOUD_NAME ?? "",
+  cloudinaryApiKey: process.env.CLOUDINARY_API_KEY ?? "",
+  cloudinaryApiSecret: process.env.CLOUDINARY_API_SECRET ?? "",
+  cloudinaryUploadFolder: process.env.CLOUDINARY_UPLOAD_FOLDER ?? "saudade",
   corsOrigins: (process.env.CORS_ORIGINS ?? "http://localhost:5173,http://localhost:8081,http://localhost:19006")
     .split(",")
     .map((origin) => origin.trim())
-    .filter(Boolean),
-  dataDir: path.join(root, "data"),
-  storageDir: path.join(root, "storage"),
-  uploadsDir: path.join(root, "storage", "uploads"),
-  qrDir: path.join(root, "storage", "qrcodes")
+    .filter(Boolean)
 };
