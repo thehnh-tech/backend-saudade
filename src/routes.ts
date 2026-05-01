@@ -1,16 +1,15 @@
-import fs from "node:fs";
-import path from "node:path";
 import bcrypt from "bcryptjs";
 import type { Express, Request, Response } from "express";
 import multer from "multer";
 import QRCode from "qrcode";
 import { z } from "zod";
 import { requireRole, signAuth } from "./auth.js";
+import { cloudinaryUrl, uploadImageBuffer } from "./cloudinary.js";
 import { config } from "./config.js";
 import { GarmentModel, PhotoModel, ProductModel, type Garment, type Photo, type Product } from "./db.js";
 import { uploadRateLimit } from "./rateLimit.js";
 import type { AuthedRequest } from "./types.js";
-import { ensureInside, isSupportedImage, nowIso, publicUrlForLocalPath, safeRandomId, writeBufferAtomic } from "./utils.js";
+import { isSupportedImage, nowIso, publicUrlForLocalPath, safeRandomId } from "./utils.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -59,22 +58,30 @@ function slugify(value: string) {
 }
 
 function garmentResponse(garment: Garment) {
+  const qrCodeUrl = cloudinaryUrl(garment.qrCodePath)
+    ? garment.qrCodePath
+    : `${config.apiPublicUrl}/${publicUrlForLocalPath(garment.qrCodePath)}`;
+
   return {
     id: garment.numericId,
     type: garment.type,
     publicToken: garment.publicToken,
     clientId: garment.clientId,
-    qrCodeUrl: `${config.apiPublicUrl}/${publicUrlForLocalPath(garment.qrCodePath)}`,
+    qrCodeUrl,
     captureUrl: `${config.webPublicUrl}/capture/${garment.publicToken}`,
     createdAt: garment.createdAt
   };
 }
 
 function photoResponse(photo: Photo) {
+  const imageUrl = cloudinaryUrl(photo.imagePath)
+    ? photo.imagePath
+    : `${config.apiPublicUrl}/${publicUrlForLocalPath(photo.imagePath)}`;
+
   return {
     id: photo.numericId,
     garmentId: photo.garmentId,
-    imageUrl: `${config.apiPublicUrl}/${publicUrlForLocalPath(photo.imagePath)}`,
+    imageUrl,
     createdAt: photo.createdAt,
     metadata: photo.metadata ?? null
   };
@@ -141,18 +148,20 @@ export function registerRoutes(app: Express) {
     const clientPassword = safeRandomId("pass", 9);
     const clientPasswordHash = await bcrypt.hash(clientPassword, 10);
     const createdAt = nowIso();
-    const qrCodePath = `storage/qrcodes/${publicToken}.png`;
-    const qrAbsolutePath = ensureInside(config.qrDir, path.join(config.qrDir, `${publicToken}.png`));
     const captureUrl = `${config.webPublicUrl}/capture/${publicToken}`;
-
-    await QRCode.toFile(qrAbsolutePath, captureUrl, { margin: 2, width: 900 });
+    const qrBuffer = await QRCode.toBuffer(captureUrl, { margin: 2, width: 900, type: "png" });
+    const qrUpload = await uploadImageBuffer(qrBuffer, {
+      folder: `${config.cloudinaryUploadFolder}/qrcodes`,
+      public_id: publicToken,
+      format: "png"
+    });
 
     const garment = await GarmentModel.create({
       type: parsed.data.type,
       publicToken,
       clientId,
       clientPasswordHash,
-      qrCodePath,
+      qrCodePath: qrUpload.secure_url,
       createdAt
     });
 
@@ -236,12 +245,12 @@ export function registerRoutes(app: Express) {
       });
     }
 
-    const extension = req.file.mimetype === "image/png" ? "png" : req.file.mimetype === "image/webp" ? "webp" : "jpg";
     const createdAt = nowIso();
-    const fileName = `${Date.now()}-${safeRandomId("photo", 8)}.${extension}`;
-    const relativePath = `storage/uploads/${garment.numericId}/${fileName}`;
-    const absolutePath = ensureInside(config.uploadsDir, path.join(config.uploadsDir, String(garment.numericId), fileName));
-    writeBufferAtomic(absolutePath, req.file.buffer);
+    const publicId = `${garment.numericId}-${Date.now()}-${safeRandomId("photo", 8)}`;
+    const uploadedPhoto = await uploadImageBuffer(req.file.buffer, {
+      folder: `${config.cloudinaryUploadFolder}/uploads/${garment.numericId}`,
+      public_id: publicId
+    });
 
     const forwarded = req.headers["x-forwarded-for"];
     const uploaderIp = Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0]?.trim() || req.ip || null;
@@ -254,7 +263,7 @@ export function registerRoutes(app: Express) {
 
     const photo = await PhotoModel.create({
       garmentId: garment.numericId,
-      imagePath: relativePath,
+      imagePath: uploadedPhoto.secure_url,
       createdAt,
       uploaderIp,
       metadata
@@ -288,11 +297,5 @@ export function registerRoutes(app: Express) {
     const photo = await PhotoModel.findOne({ numericId: photoId, garmentId: req.auth?.garmentId }).lean<Photo>();
     if (!photo) return res.status(404).json({ error: "PHOTO_NOT_FOUND" });
     return res.json({ photo: photoResponse(photo) });
-  });
-
-  app.use("/storage", (req, res, next) => {
-    const requested = ensureInside(config.storageDir, path.join(config.storageDir, req.path));
-    if (!fs.existsSync(requested)) return res.status(404).end();
-    return next();
   });
 }

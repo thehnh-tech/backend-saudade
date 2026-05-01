@@ -1,10 +1,6 @@
-import fs from "node:fs";
 import mongoose, { Schema } from "mongoose";
 import { config } from "./config.js";
 import { defaultProducts } from "./defaultProducts.js";
-
-fs.mkdirSync(config.uploadsDir, { recursive: true });
-fs.mkdirSync(config.qrDir, { recursive: true });
 
 const counterSchema = new Schema({
   _id: { type: String, required: true },

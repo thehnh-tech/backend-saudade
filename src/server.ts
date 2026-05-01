@@ -1,16 +1,16 @@
 import express from "express";
 import cors from "cors";
 import helmetDefault from "helmet";
-import { config } from "./config.js";
-import { connectDb } from "./db.js";
-import { registerRoutes } from "./routes.js";
-import { registerCheckoutRoutes, registerStripeWebhook } from "./stripeRoutes.js";
 
 type HelmetMiddleware = (
   options?: { crossOriginResourcePolicy?: { policy: "cross-origin" | "same-origin" | "same-site" } }
 ) => (req: express.Request, res: express.Response, next: express.NextFunction) => void;
 
 const helmet = helmetDefault as unknown as HelmetMiddleware;
+import { config } from "./config.js";
+import { connectDb } from "./db.js";
+import { registerRoutes } from "./routes.js";
+import { registerCheckoutRoutes, registerStripeWebhook } from "./stripeRoutes.js";
 
 const app = express();
 
@@ -24,7 +24,6 @@ app.use(cors({
 }));
 registerStripeWebhook(app);
 app.use(express.json({ limit: "1mb" }));
-app.use("/storage", express.static(config.storageDir, { fallthrough: true, immutable: false }));
 
 registerCheckoutRoutes(app);
 registerRoutes(app);

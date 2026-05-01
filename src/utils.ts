@@ -1,6 +1,4 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 
 export function nowIso() {
   return new Date().toISOString();
@@ -13,22 +11,6 @@ export function safeRandomId(prefix: string, size = 10) {
 
 export function publicUrlForLocalPath(localPath: string) {
   return localPath.replaceAll("\\", "/");
-}
-
-export function ensureInside(baseDir: string, candidate: string) {
-  const base = path.resolve(baseDir);
-  const target = path.resolve(candidate);
-  if (!target.startsWith(base)) {
-    throw new Error("Unsafe path");
-  }
-  return target;
-}
-
-export function writeBufferAtomic(filePath: string, buffer: Buffer) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.${crypto.randomBytes(6).toString("hex")}.tmp`;
-  fs.writeFileSync(tmp, buffer);
-  fs.renameSync(tmp, filePath);
 }
 
 export function isSupportedImage(buffer: Buffer) {
