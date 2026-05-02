@@ -49,6 +49,21 @@ const createProductSchema = z.object({
   sizes: z.array(z.string().trim().min(1).max(8)).default(["XS", "S", "M", "L", "XL", "XXL"])
 });
 
+const updateProductSchema = z.object({
+  title: z.string().trim().min(3).max(140).optional(),
+  shortTitle: z.string().trim().min(2).max(60).optional(),
+  colorway: z.string().trim().min(3).max(60).optional(),
+  price: z.number().positive().max(10000).optional(),
+  status: z.enum(["available", "coming-soon", "draft"]).optional(),
+  category: z.string().trim().min(2).max(60).optional(),
+  collection: z.string().trim().min(2).max(100).optional(),
+  description: z.string().trim().min(8).max(800).optional(),
+  vibe: z.string().trim().min(3).max(160).optional(),
+  cardImage: z.string().trim().min(1).optional(),
+  tags: z.array(z.string().trim().min(1).max(40)).optional(),
+  sizes: z.array(z.string().trim().min(1).max(8)).optional()
+}).refine((value) => Object.keys(value).length > 0, { message: "Provide at least one field to update." });
+
 function slugify(value: string) {
   return value
     .toLowerCase()
@@ -57,7 +72,7 @@ function slugify(value: string) {
     .slice(0, 80);
 }
 
-function garmentResponse(garment: Garment) {
+function garmentResponse(garment: Garment, options: { includePassword?: boolean } = {}) {
   const qrCodeUrl = cloudinaryUrl(garment.qrCodePath)
     ? garment.qrCodePath
     : `${config.apiPublicUrl}/${publicUrlForLocalPath(garment.qrCodePath)}`;
@@ -69,7 +84,8 @@ function garmentResponse(garment: Garment) {
     clientId: garment.clientId,
     qrCodeUrl,
     captureUrl: `${config.webPublicUrl}/capture/${garment.publicToken}`,
-    createdAt: garment.createdAt
+    createdAt: garment.createdAt,
+    ...(options.includePassword ? { clientPassword: garment.clientPasswordPlain ?? null } : {})
   };
 }
 
@@ -88,6 +104,7 @@ function photoResponse(photo: Photo) {
 }
 
 function productResponse(product: Product) {
+  const images = product.images.filter((image) => !["/assets/back.png", "/assets/poster-back-transparent.png"].includes(image.src));
   return {
     id: product.productId,
     slug: product.slug,
@@ -104,7 +121,7 @@ function productResponse(product: Product) {
     vibe: product.vibe,
     cardImage: product.cardImage,
     details: product.details,
-    images: product.images,
+    images,
     variants: product.variants,
     sizes: product.sizes,
     status: product.status,
@@ -161,16 +178,25 @@ export function registerRoutes(app: Express) {
       publicToken,
       clientId,
       clientPasswordHash,
+      clientPasswordPlain: clientPassword,
       qrCodePath: qrUpload.secure_url,
       createdAt
     });
 
-    return res.status(201).json({ ...garmentResponse(garment.toObject() as Garment), clientPassword });
+    return res.status(201).json({ ...garmentResponse(garment.toObject() as Garment, { includePassword: true }), clientPassword });
   });
 
   app.get("/api/admin/garments", requireRole("admin"), async (_req, res) => {
     const garments = await GarmentModel.find().sort({ createdAt: -1 }).lean<Garment[]>();
-    return res.json({ garments: garments.map(garmentResponse) });
+    return res.json({ garments: garments.map((garment) => garmentResponse(garment, { includePassword: true })) });
+  });
+
+  app.delete("/api/admin/garments/:id", requireRole("admin"), async (req, res) => {
+    const numericId = Number(req.params.id);
+    if (!Number.isFinite(numericId)) return res.status(400).json({ error: "INVALID_ID" });
+    const removed = await GarmentModel.findOneAndDelete({ numericId });
+    if (!removed) return res.status(404).json({ error: "GARMENT_NOT_FOUND" });
+    return res.json({ ok: true });
   });
 
   app.post("/api/admin/products", requireRole("admin"), async (req: Request, res: Response) => {
@@ -218,6 +244,41 @@ export function registerRoutes(app: Express) {
   app.get("/api/admin/products", requireRole("admin"), async (_req, res) => {
     const products = await ProductModel.find().sort({ createdAt: -1 }).lean<Product[]>();
     return res.json({ products: products.map(productResponse) });
+  });
+
+  app.patch("/api/admin/products/:id", requireRole("admin"), async (req: Request, res: Response) => {
+    const parsed = updateProductSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
+
+    const product = await ProductModel.findOne({ productId: req.params.id });
+    if (!product) return res.status(404).json({ error: "PRODUCT_NOT_FOUND" });
+
+    const data = parsed.data;
+    if (data.title !== undefined) product.title = data.title;
+    if (data.shortTitle !== undefined) product.shortTitle = data.shortTitle;
+    if (data.colorway !== undefined) product.colorway = data.colorway;
+    if (data.price !== undefined) {
+      product.price = data.price;
+      product.unitAmount = Math.round(data.price * 100);
+    }
+    if (data.status !== undefined) product.status = data.status;
+    if (data.category !== undefined) product.category = data.category;
+    if (data.collection !== undefined) product.set("collection", data.collection);
+    if (data.description !== undefined) product.description = data.description;
+    if (data.vibe !== undefined) product.vibe = data.vibe;
+    if (data.cardImage !== undefined) product.cardImage = data.cardImage;
+    if (data.tags !== undefined) product.tags = data.tags;
+    if (data.sizes !== undefined) product.sizes = data.sizes;
+    product.updatedAt = nowIso();
+
+    await product.save();
+    return res.json({ product: productResponse(product.toObject() as Product) });
+  });
+
+  app.delete("/api/admin/products/:id", requireRole("admin"), async (req, res) => {
+    const removed = await ProductModel.findOneAndDelete({ productId: req.params.id });
+    if (!removed) return res.status(404).json({ error: "PRODUCT_NOT_FOUND" });
+    return res.json({ ok: true });
   });
 
   app.get("/api/qr/:publicToken", async (req, res) => {

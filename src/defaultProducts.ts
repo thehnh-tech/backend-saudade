@@ -47,11 +47,9 @@ const baseProduct = {
   images: [
     { label: "Product card", src: "/assets/tee-white-red-card.png", kind: "card" },
     { label: "Front print", src: "/assets/front.png", kind: "front" },
-    { label: "Back print", src: "/assets/back.png", kind: "back" },
     { label: "Inner neck", src: "/assets/inner.png", kind: "detail" },
     { label: "Outer neck", src: "/assets/outer.png", kind: "detail" },
-    { label: "Front artwork", src: "/assets/bgfront.png", kind: "detail" },
-    { label: "Back artwork", src: "/assets/poster-back-transparent.png", kind: "detail" }
+    { label: "Front artwork", src: "/assets/bgfront.png", kind: "detail" }
   ],
   variants: [
     { name: "White / Red", textile: "#F4F1EC", print: "#D71920", accent: "#D71920" },
