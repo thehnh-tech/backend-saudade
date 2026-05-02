@@ -39,7 +39,7 @@ export const config = {
   // Resend (transactional email)
   resendApiKey: process.env.RESEND_API_KEY ?? "",
   mailFrom: process.env.MAIL_FROM ?? "SAUDADE <orders@saudade.thehnh.tech>",
-  mailReplyTo: process.env.MAIL_REPLY_TO ?? "hello@saudade.thehnh.tech",
+  mailReplyTo: process.env.MAIL_REPLY_TO ?? "contact@thehnh.tech",
   mailAdminBcc: process.env.MAIL_ADMIN_BCC ?? "",
 
   corsOrigins: (process.env.CORS_ORIGINS ?? "http://localhost:5173,http://localhost:8081,http://localhost:19006,http://localhost:3000")
