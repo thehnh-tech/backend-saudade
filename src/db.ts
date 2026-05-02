@@ -13,6 +13,7 @@ const garmentSchema = new Schema({
   publicToken: { type: String, required: true, unique: true, index: true },
   clientId: { type: String, required: true, unique: true, index: true },
   clientPasswordHash: { type: String, required: true },
+  clientPasswordPlain: { type: String, default: null },
   qrCodePath: { type: String, required: true },
   createdAt: { type: String, required: true }
 });
@@ -97,6 +98,7 @@ export type Garment = {
   publicToken: string;
   clientId: string;
   clientPasswordHash: string;
+  clientPasswordPlain: string | null;
   qrCodePath: string;
   createdAt: string;
 };
