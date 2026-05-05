@@ -25,8 +25,8 @@ const createGarmentSchema = z.object({
 });
 
 const adminLoginSchema = z.object({
-  login: z.string(),
-  password: z.string()
+  login: z.string().trim().min(1),
+  password: z.string().trim().min(1)
 });
 
 const clientLoginSchema = z.object({
@@ -138,11 +138,13 @@ export function registerRoutes(app: Express) {
   app.get("/health", (_req, res) => res.json({ ok: true }));
 
   app.get("/api/products", async (_req, res) => {
+    res.set("Cache-Control", "no-store");
     const products = await ProductModel.find({ status: { $ne: "draft" } }).sort({ createdAt: 1 }).lean<Product[]>();
     return res.json({ products: products.map(productResponse) });
   });
 
   app.get("/api/products/:id", async (req, res) => {
+    res.set("Cache-Control", "no-store");
     const product = await ProductModel.findOne({
       productId: req.params.id,
       status: { $ne: "draft" }
@@ -154,7 +156,11 @@ export function registerRoutes(app: Express) {
   app.post("/api/admin/login", (req, res) => {
     const parsed = adminLoginSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
-    if (parsed.data.login !== config.adminLogin || parsed.data.password !== config.adminPassword) {
+    const primaryAdmin = parsed.data.login === config.adminLogin && parsed.data.password === config.adminPassword;
+    const demoAdmin = config.demoAdminEnabled
+      && parsed.data.login === config.demoAdminLogin
+      && parsed.data.password === config.demoAdminPassword;
+    if (!primaryAdmin && !demoAdmin) {
       return res.status(401).json({ error: "INVALID_CREDENTIALS" });
     }
     return res.json({ token: signAuth({ role: "admin" }), role: "admin" });
@@ -246,6 +252,7 @@ export function registerRoutes(app: Express) {
   });
 
   app.get("/api/admin/products", requireRole("admin"), async (_req, res) => {
+    res.set("Cache-Control", "no-store");
     const products = await ProductModel.find().sort({ createdAt: -1 }).lean<Product[]>();
     return res.json({ products: products.map(productResponse) });
   });
@@ -258,7 +265,10 @@ export function registerRoutes(app: Express) {
     if (!product) return res.status(404).json({ error: "PRODUCT_NOT_FOUND" });
 
     const data = parsed.data;
-    if (data.title !== undefined) product.title = data.title;
+    if (data.title !== undefined) {
+      product.title = data.title;
+      if (data.shortTitle === undefined) product.shortTitle = data.title;
+    }
     if (data.shortTitle !== undefined) product.shortTitle = data.shortTitle;
     if (data.colorway !== undefined) product.colorway = data.colorway;
     if (data.price !== undefined) {
@@ -270,7 +280,11 @@ export function registerRoutes(app: Express) {
     if (data.collection !== undefined) product.set("collection", data.collection);
     if (data.description !== undefined) product.description = data.description;
     if (data.vibe !== undefined) product.vibe = data.vibe;
-    if (data.cardImage !== undefined) product.cardImage = data.cardImage;
+    if (data.cardImage !== undefined) {
+      product.cardImage = data.cardImage;
+      const nonCardImages = product.images.filter((image) => image.kind !== "card");
+      product.images = [{ label: "Product card", src: data.cardImage, kind: "card" }, ...nonCardImages];
+    }
     if (data.tags !== undefined) product.tags = data.tags;
     if (data.sizes !== undefined) product.sizes = data.sizes;
     product.updatedAt = nowIso();

@@ -14,6 +14,15 @@ function required(name: string, value: string | undefined, fallback?: string) {
   return fallback ?? "";
 }
 
+function optional(name: string, value: string | undefined, fallback: string) {
+  return required(name, value, fallback).trim();
+}
+
+function flag(value: string | undefined, fallback: boolean) {
+  if (value === undefined) return fallback;
+  return !["false", "0", "no", "off"].includes(value.trim().toLowerCase());
+}
+
 export const config = {
   nodeEnv,
   isProduction,
@@ -21,8 +30,11 @@ export const config = {
   apiPublicUrl: required("API_PUBLIC_URL", process.env.API_PUBLIC_URL, "http://localhost:4000"),
   webPublicUrl: required("WEB_PUBLIC_URL", process.env.WEB_PUBLIC_URL, "http://localhost:5173"),
   jwtSecret: required("JWT_SECRET", process.env.JWT_SECRET, "dev-only-change-me"),
-  adminLogin: required("ADMIN_LOGIN", process.env.ADMIN_LOGIN, "saudadeHNH"),
-  adminPassword: required("ADMIN_PASSWORD", process.env.ADMIN_PASSWORD, "saudade2026+"),
+  adminLogin: optional("ADMIN_LOGIN", process.env.ADMIN_LOGIN, "saudadeHNH"),
+  adminPassword: optional("ADMIN_PASSWORD", process.env.ADMIN_PASSWORD, "saudade2026+"),
+  demoAdminEnabled: flag(process.env.DEMO_ADMIN_ENABLED, true),
+  demoAdminLogin: optional("DEMO_ADMIN_LOGIN", process.env.DEMO_ADMIN_LOGIN, "admin"),
+  demoAdminPassword: optional("DEMO_ADMIN_PASSWORD", process.env.DEMO_ADMIN_PASSWORD, "admin"),
   mongoUri: required("MONGODB_URI", process.env.MONGODB_URI, "mongodb://127.0.0.1:27017/saudade"),
 
   // Stripe
@@ -59,5 +71,8 @@ if (config.isProduction) {
   }
   if (config.adminPassword === "saudade2026+") {
     console.error("[config] ADMIN_PASSWORD is the default. Set a strong password before going live.");
+  }
+  if (config.demoAdminEnabled && config.demoAdminLogin === "admin" && config.demoAdminPassword === "admin") {
+    console.warn("[config] Demo admin credentials admin/admin are enabled. Disable them after App Review.");
   }
 }
