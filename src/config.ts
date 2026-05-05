@@ -5,8 +5,18 @@ dotenv.config();
 const nodeEnv = process.env.NODE_ENV ?? "development";
 const isProduction = nodeEnv === "production";
 
+function cleanEnvValue(value: string) {
+  const trimmed = value.trim();
+  const first = trimmed[0];
+  const last = trimmed[trimmed.length - 1];
+  if ((first === "\"" && last === "\"") || (first === "'" && last === "'")) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
 function required(name: string, value: string | undefined, fallback?: string) {
-  if (value && value.trim().length > 0) return value;
+  if (value && value.trim().length > 0) return cleanEnvValue(value);
   if (!isProduction && fallback !== undefined) return fallback;
   if (isProduction) {
     console.warn(`[config] ${name} is missing in production. Some features will be disabled.`);
@@ -15,12 +25,12 @@ function required(name: string, value: string | undefined, fallback?: string) {
 }
 
 function optional(name: string, value: string | undefined, fallback: string) {
-  return required(name, value, fallback).trim();
+  return required(name, value, fallback);
 }
 
 function flag(value: string | undefined, fallback: boolean) {
   if (value === undefined) return fallback;
-  return !["false", "0", "no", "off"].includes(value.trim().toLowerCase());
+  return !["false", "0", "no", "off"].includes(cleanEnvValue(value).toLowerCase());
 }
 
 export const config = {
