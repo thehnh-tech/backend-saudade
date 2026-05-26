@@ -401,7 +401,7 @@ export function registerRoutes(app: Express) {
     const valid = await bcrypt.compare(parsed.data.password, garment.clientPasswordHash);
     if (!valid) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
     return res.json({
-      token: signAuth({ role: "client", garmentId: garment.numericId, clientId: garment.clientId }),
+      token: signAuth({ role: "client", garmentId: garment.numericId, clientId: garment.clientId }, {}),
       role: "client",
       garment: garmentResponse(garment)
     });

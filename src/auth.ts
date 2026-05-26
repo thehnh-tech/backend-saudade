@@ -1,10 +1,12 @@
 import type { NextFunction, Response } from "express";
-import jwt from "jsonwebtoken";
+import jwt, { type SignOptions } from "jsonwebtoken";
 import { config } from "./config.js";
 import type { AuthedRequest, AuthPayload, AuthRole } from "./types.js";
 
-export function signAuth(payload: AuthPayload) {
-  return jwt.sign(payload, config.jwtSecret, { expiresIn: "7d" });
+const defaultAuthOptions: SignOptions = { expiresIn: "7d" };
+
+export function signAuth(payload: AuthPayload, options: SignOptions = defaultAuthOptions) {
+  return jwt.sign(payload, config.jwtSecret, options);
 }
 
 export function requireRole(role: AuthRole) {
