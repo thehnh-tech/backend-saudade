@@ -40,11 +40,11 @@ export const config = {
   apiPublicUrl: required("API_PUBLIC_URL", process.env.API_PUBLIC_URL, "http://localhost:4000"),
   webPublicUrl: required("WEB_PUBLIC_URL", process.env.WEB_PUBLIC_URL, "http://localhost:5173"),
   jwtSecret: required("JWT_SECRET", process.env.JWT_SECRET, "dev-only-change-me"),
-  adminLogin: optional("ADMIN_LOGIN", process.env.ADMIN_LOGIN, "saudadeHNH"),
-  adminPassword: optional("ADMIN_PASSWORD", process.env.ADMIN_PASSWORD, "saudade2026+"),
-  demoAdminEnabled: flag(process.env.DEMO_ADMIN_ENABLED, true),
-  demoAdminLogin: optional("DEMO_ADMIN_LOGIN", process.env.DEMO_ADMIN_LOGIN, "admin"),
-  demoAdminPassword: optional("DEMO_ADMIN_PASSWORD", process.env.DEMO_ADMIN_PASSWORD, "admin"),
+  adminLogin: optional("ADMIN_LOGIN", process.env.ADMIN_LOGIN, "admin"),
+  adminPassword: required("ADMIN_PASSWORD", process.env.ADMIN_PASSWORD, isProduction ? undefined : "admin"),
+  demoAdminEnabled: flag(process.env.DEMO_ADMIN_ENABLED, false),
+  demoAdminLogin: optional("DEMO_ADMIN_LOGIN", process.env.DEMO_ADMIN_LOGIN, "demo-admin"),
+  demoAdminPassword: optional("DEMO_ADMIN_PASSWORD", process.env.DEMO_ADMIN_PASSWORD, "demo-admin"),
   mongoUri: required("MONGODB_URI", process.env.MONGODB_URI, "mongodb://127.0.0.1:27017/saudade"),
 
   // Stripe
@@ -79,10 +79,10 @@ if (config.isProduction) {
   if (!config.resendApiKey) {
     console.warn("[config] RESEND_API_KEY missing. Order confirmation emails are disabled.");
   }
-  if (config.adminPassword === "saudade2026+") {
-    console.error("[config] ADMIN_PASSWORD is the default. Set a strong password before going live.");
+  if (!config.adminPassword || config.adminPassword === "admin") {
+    console.error("[config] ADMIN_PASSWORD must be set to a strong value before going live.");
   }
-  if (config.demoAdminEnabled && config.demoAdminLogin === "admin" && config.demoAdminPassword === "admin") {
-    console.warn("[config] Demo admin credentials admin/admin are enabled. Disable them after App Review.");
+  if (config.demoAdminEnabled) {
+    console.warn("[config] Demo admin credentials are enabled. Disable them unless they are explicitly needed.");
   }
 }
