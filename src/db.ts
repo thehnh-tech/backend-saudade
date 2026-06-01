@@ -10,6 +10,7 @@ const counterSchema = new Schema({
 const garmentSchema = new Schema({
   numericId: { type: Number, required: true, unique: true, index: true },
   type: { type: String, required: true, trim: true },
+  purpose: { type: String, required: true, default: "client-feed", index: true },
   publicToken: { type: String, required: true, unique: true, index: true },
   clientId: { type: String, required: true, unique: true, index: true },
   clientPasswordHash: { type: String, required: true },
@@ -96,6 +97,7 @@ type Counter = {
 export type Garment = {
   numericId: number;
   type: string;
+  purpose?: "client-feed" | "public-feed";
   publicToken: string;
   clientId: string;
   clientPasswordHash: string;

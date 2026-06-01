@@ -7,6 +7,7 @@ import { requireRole, signAuth } from "./auth.js";
 import { cloudinaryUrl, uploadImageBuffer } from "./cloudinary.js";
 import { config } from "./config.js";
 import { GarmentModel, PhotoModel, ProductModel, type Garment, type Photo, type Product } from "./db.js";
+import { sendPublicCaptureEmail } from "./mailer.js";
 import { uploadRateLimit } from "./rateLimit.js";
 import type { AuthedRequest } from "./types.js";
 import { isSupportedImage, nowIso, publicUrlForLocalPath, safeRandomId } from "./utils.js";
@@ -19,6 +20,10 @@ const upload = multer({
     else cb(new Error("Unsupported image type"));
   }
 });
+
+const PUBLIC_FEED_PURPOSE = "public-feed" as const;
+const CLIENT_FEED_PURPOSE = "client-feed" as const;
+const PUBLIC_FEED_GARMENT_TYPE = "picture-me-sticker";
 
 const createGarmentSchema = z.object({
   type: z.string().trim().min(2).max(40).default("tshirt")
@@ -72,14 +77,69 @@ function slugify(value: string) {
     .slice(0, 80);
 }
 
+function bodyString(value: unknown) {
+  if (Array.isArray(value)) return bodyString(value[0]);
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function bodyFlag(value: unknown) {
+  return ["true", "1", "yes", "on"].includes(bodyString(value).toLowerCase());
+}
+
+function garmentPurpose(garment: Garment) {
+  return garment.purpose ?? CLIENT_FEED_PURPOSE;
+}
+
+function isPublicFeedGarment(garment: Garment) {
+  return garmentPurpose(garment) === PUBLIC_FEED_PURPOSE;
+}
+
+async function createGarmentKit(type: string, purpose: typeof CLIENT_FEED_PURPOSE | typeof PUBLIC_FEED_PURPOSE) {
+  const publicToken = safeRandomId("qr", 18);
+  const clientId = safeRandomId("client", 9);
+  const clientPassword = safeRandomId("pass", 9);
+  const clientPasswordHash = await bcrypt.hash(clientPassword, 10);
+  const createdAt = nowIso();
+  const captureUrl = `${config.webPublicUrl}/capture/${publicToken}`;
+  const qrBuffer = await QRCode.toBuffer(captureUrl, { margin: 2, width: 900, type: "png" });
+  const qrUpload = await uploadImageBuffer(qrBuffer, {
+    folder: `${config.cloudinaryUploadFolder}/qrcodes`,
+    public_id: publicToken,
+    format: "png"
+  });
+
+  const garment = await GarmentModel.create({
+    type,
+    purpose,
+    publicToken,
+    clientId,
+    clientPasswordHash,
+    clientPasswordPlain: clientPassword,
+    qrCodePath: qrUpload.secure_url,
+    createdAt
+  });
+
+  return { garment: garment.toObject() as Garment, clientPassword };
+}
+
+async function ensurePublicFeedGarment() {
+  const existing = await GarmentModel.findOne({ purpose: PUBLIC_FEED_PURPOSE }).sort({ createdAt: -1 }).lean<Garment>();
+  if (existing) return existing;
+  const created = await createGarmentKit(PUBLIC_FEED_GARMENT_TYPE, PUBLIC_FEED_PURPOSE);
+  return created.garment;
+}
+
 function garmentResponse(garment: Garment, options: { includePassword?: boolean } = {}) {
   const qrCodeUrl = cloudinaryUrl(garment.qrCodePath)
     ? garment.qrCodePath
     : `${config.apiPublicUrl}/${publicUrlForLocalPath(garment.qrCodePath)}`;
+  const purpose = garmentPurpose(garment);
 
   return {
     id: garment.numericId,
     type: garment.type,
+    purpose,
+    captureKind: purpose === PUBLIC_FEED_PURPOSE ? "public-feed" : "client-feed",
     publicToken: garment.publicToken,
     clientId: garment.clientId,
     qrCodeUrl,
@@ -104,6 +164,30 @@ function photoResponse(photo: Photo) {
     secondaryImageUrl,
     createdAt: photo.createdAt,
     metadata: photo.metadata ?? null
+  };
+}
+
+function publicFeedPhotoResponse(photo: Photo) {
+  const base = photoResponse(photo);
+  const metadata = photo.metadata ?? {};
+  const captureMode = typeof metadata.captureMode === "string" ? metadata.captureMode : "double";
+  return {
+    ...base,
+    captureMode,
+    primaryLabel: captureMode === "front" ? "Front" : captureMode === "back" ? "Back" : "Rear",
+    secondaryLabel: base.secondaryImageUrl ? "Front" : null
+  };
+}
+
+function adminPublicFeedPhotoResponse(photo: Photo) {
+  const metadata = photo.metadata ?? {};
+  return {
+    ...publicFeedPhotoResponse(photo),
+    uploaderIp: photo.uploaderIp,
+    email: typeof metadata.email === "string" ? metadata.email : null,
+    marketingConsent: Boolean(metadata.marketingConsent),
+    moderationStatus: typeof metadata.moderationStatus === "string" ? metadata.moderationStatus : "visible",
+    userAgent: typeof metadata.userAgent === "string" ? metadata.userAgent : null
   };
 }
 
@@ -136,6 +220,17 @@ function productResponse(product: Product) {
 
 export function registerRoutes(app: Express) {
   app.get("/health", (_req, res) => res.json({ ok: true }));
+
+  app.get("/api/public-feed/photos", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    const requestedLimit = Number(req.query.limit ?? 30);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 60) : 30;
+    const photos = await PhotoModel.find({ "metadata.publicFeed": true })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean<Photo[]>();
+    return res.json({ photos: photos.map(publicFeedPhotoResponse), updatedAt: nowIso() });
+  });
 
   app.get("/api/products", async (_req, res) => {
     res.set("Cache-Control", "no-store");
@@ -170,42 +265,47 @@ export function registerRoutes(app: Express) {
     const parsed = createGarmentSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
 
-    const publicToken = safeRandomId("qr", 18);
-    const clientId = safeRandomId("client", 9);
-    const clientPassword = safeRandomId("pass", 9);
-    const clientPasswordHash = await bcrypt.hash(clientPassword, 10);
-    const createdAt = nowIso();
-    const captureUrl = `${config.webPublicUrl}/capture/${publicToken}`;
-    const qrBuffer = await QRCode.toBuffer(captureUrl, { margin: 2, width: 900, type: "png" });
-    const qrUpload = await uploadImageBuffer(qrBuffer, {
-      folder: `${config.cloudinaryUploadFolder}/qrcodes`,
-      public_id: publicToken,
-      format: "png"
-    });
-
-    const garment = await GarmentModel.create({
-      type: parsed.data.type,
-      publicToken,
-      clientId,
-      clientPasswordHash,
-      clientPasswordPlain: clientPassword,
-      qrCodePath: qrUpload.secure_url,
-      createdAt
-    });
-
-    return res.status(201).json({ ...garmentResponse(garment.toObject() as Garment, { includePassword: true }), clientPassword });
+    const { garment, clientPassword } = await createGarmentKit(parsed.data.type, CLIENT_FEED_PURPOSE);
+    return res.status(201).json({ ...garmentResponse(garment, { includePassword: true }), clientPassword });
   });
 
   app.get("/api/admin/garments", requireRole("admin"), async (_req, res) => {
-    const garments = await GarmentModel.find().sort({ createdAt: -1 }).lean<Garment[]>();
+    const garments = await GarmentModel.find({
+      $or: [{ purpose: { $exists: false } }, { purpose: CLIENT_FEED_PURPOSE }]
+    }).sort({ createdAt: -1 }).lean<Garment[]>();
     return res.json({ garments: garments.map((garment) => garmentResponse(garment, { includePassword: true })) });
   });
 
   app.delete("/api/admin/garments/:id", requireRole("admin"), async (req, res) => {
     const numericId = Number(req.params.id);
     if (!Number.isFinite(numericId)) return res.status(400).json({ error: "INVALID_ID" });
-    const removed = await GarmentModel.findOneAndDelete({ numericId });
+    const removed = await GarmentModel.findOneAndDelete({
+      numericId,
+      $or: [{ purpose: { $exists: false } }, { purpose: CLIENT_FEED_PURPOSE }]
+    });
     if (!removed) return res.status(404).json({ error: "GARMENT_NOT_FOUND" });
+    return res.json({ ok: true });
+  });
+
+  app.get("/api/admin/public-feed/qr", requireRole("admin"), async (_req, res) => {
+    const garment = await ensurePublicFeedGarment();
+    return res.json({ qr: garmentResponse(garment, { includePassword: false }) });
+  });
+
+  app.get("/api/admin/public-feed/photos", requireRole("admin"), async (_req, res) => {
+    res.set("Cache-Control", "no-store");
+    const photos = await PhotoModel.find({ "metadata.publicFeed": true })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean<Photo[]>();
+    return res.json({ photos: photos.map(adminPublicFeedPhotoResponse) });
+  });
+
+  app.delete("/api/admin/public-feed/photos/:id", requireRole("admin"), async (req, res) => {
+    const numericId = Number(req.params.id);
+    if (!Number.isFinite(numericId)) return res.status(400).json({ error: "INVALID_PHOTO_ID" });
+    const removed = await PhotoModel.findOneAndDelete({ numericId, "metadata.publicFeed": true });
+    if (!removed) return res.status(404).json({ error: "PHOTO_NOT_FOUND" });
     return res.json({ ok: true });
   });
 
@@ -302,9 +402,12 @@ export function registerRoutes(app: Express) {
   app.get("/api/qr/:publicToken", async (req, res) => {
     const garment = await GarmentModel.findOne({ publicToken: req.params.publicToken }).lean<Garment>();
     if (!garment) return res.status(404).json({ error: "QR_NOT_FOUND" });
+    const purpose = garmentPurpose(garment);
     return res.json({
       id: garment.numericId,
       type: garment.type,
+      purpose,
+      captureKind: purpose === PUBLIC_FEED_PURPOSE ? "public-feed" : "client-feed",
       publicToken: garment.publicToken,
       createdAt: garment.createdAt
     });
@@ -317,6 +420,7 @@ export function registerRoutes(app: Express) {
     async (req, res) => {
       const garment = await GarmentModel.findOne({ publicToken: req.params.publicToken }).lean<Garment>();
       if (!garment) return res.status(404).json({ error: "QR_NOT_FOUND" });
+      const publicFeedUpload = isPublicFeedGarment(garment);
 
       const files = (req.files as Express.Multer.File[] | undefined) ?? [];
       const captureMode = String(req.body.captureMode ?? "double");
@@ -327,6 +431,26 @@ export function registerRoutes(app: Express) {
           error: "CAMERA_CAPTURE_REQUIRED",
           message: "Upload must come from the web app camera stream."
         });
+      }
+      const emailValue = bodyString(req.body.email).toLowerCase();
+      const marketingConsent = bodyFlag(req.body.marketingConsent);
+
+      let publicFeedEmail: string | null = null;
+      if (publicFeedUpload) {
+        const parsedEmail = z.string().email().safeParse(emailValue);
+        if (!parsedEmail.success) {
+          return res.status(400).json({
+            error: "EMAIL_REQUIRED",
+            message: "Enter a valid email to receive your photos."
+          });
+        }
+        if (!marketingConsent) {
+          return res.status(400).json({
+            error: "CONSENT_REQUIRED",
+            message: "Consent is required before sending a public feed photo."
+          });
+        }
+        publicFeedEmail = parsedEmail.data;
       }
 
       const firstFile = (names: string[]) => files.find((file) => names.includes(file.fieldname)) ?? null;
@@ -378,6 +502,11 @@ export function registerRoutes(app: Express) {
         captureSource,
         captureMode,
         captureSide: captureSide || null,
+        publicFeed: publicFeedUpload,
+        publicFeedSource: publicFeedUpload ? "picture-me-sticker" : null,
+        email: publicFeedEmail,
+        marketingConsent: publicFeedUpload ? marketingConsent : null,
+        moderationStatus: publicFeedUpload ? "visible" : null,
         userAgent: req.headers["user-agent"] ?? null
       };
 
@@ -390,7 +519,22 @@ export function registerRoutes(app: Express) {
         metadata
       });
 
-      return res.status(201).json({ photo: photoResponse(photo.toObject() as Photo) });
+      const responsePhoto = photoResponse(photo.toObject() as Photo);
+      if (publicFeedUpload && publicFeedEmail) {
+        try {
+          await sendPublicCaptureEmail({
+            recipientEmail: publicFeedEmail,
+            photoId: responsePhoto.id,
+            primaryImageUrl: responsePhoto.imageUrl,
+            secondaryImageUrl: responsePhoto.secondaryImageUrl,
+            createdAt
+          });
+        } catch (error) {
+          console.error("[public-feed] sendPublicCaptureEmail failed", error);
+        }
+      }
+
+      return res.status(201).json({ photo: responsePhoto, publicFeed: publicFeedUpload });
     });
 
   app.post("/api/client/login", async (req, res) => {

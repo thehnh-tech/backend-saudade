@@ -64,7 +64,7 @@ export const config = {
   mailReplyTo: process.env.MAIL_REPLY_TO ?? "contact@thehnh.tech",
   mailAdminBcc: process.env.MAIL_ADMIN_BCC ?? "",
 
-  corsOrigins: (process.env.CORS_ORIGINS ?? "http://localhost:5173,http://localhost:8081,http://localhost:19006,http://localhost:3000")
+  corsOrigins: (process.env.CORS_ORIGINS ?? "http://localhost:5173,http://localhost:8081,http://localhost:19006,http://localhost:3000,https://saudade.thehnh.tech,https://www.saudade.thehnh.tech")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean)
