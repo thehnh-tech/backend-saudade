@@ -436,18 +436,18 @@ export function registerRoutes(app: Express) {
       const marketingConsent = bodyFlag(req.body.marketingConsent);
 
       let publicFeedEmail: string | null = null;
-      if (publicFeedUpload) {
+      if (publicFeedUpload && emailValue) {
         const parsedEmail = z.string().email().safeParse(emailValue);
         if (!parsedEmail.success) {
           return res.status(400).json({
-            error: "EMAIL_REQUIRED",
-            message: "Enter a valid email to receive your photos."
+            error: "INVALID_EMAIL",
+            message: "Enter a valid email or leave the email field empty."
           });
         }
         if (!marketingConsent) {
           return res.status(400).json({
             error: "CONSENT_REQUIRED",
-            message: "Consent is required before sending a public feed photo."
+            message: "Consent is required only if you want to receive your photos and offers by email."
           });
         }
         publicFeedEmail = parsedEmail.data;
