@@ -7,6 +7,7 @@ import { requireRole, signAuth } from "./auth.js";
 import { cloudinaryUrl, uploadImageBuffer } from "./cloudinary.js";
 import { config } from "./config.js";
 import { GarmentModel, PhotoModel, ProductModel, type Garment, type Photo, type Product } from "./db.js";
+import { countryFromLocale, lookupGeo } from "./geo.js";
 import { sendPublicCaptureEmail } from "./mailer.js";
 import { uploadRateLimit } from "./rateLimit.js";
 import type { AuthedRequest } from "./types.js";
@@ -171,11 +172,24 @@ function publicFeedPhotoResponse(photo: Photo) {
   const base = photoResponse(photo);
   const metadata = photo.metadata ?? {};
   const captureMode = typeof metadata.captureMode === "string" ? metadata.captureMode : "double";
+  const country = typeof metadata.country === "string" ? metadata.country : null;
+  const countryCode = typeof metadata.countryCode === "string" ? metadata.countryCode : null;
+  const city = typeof metadata.city === "string" ? metadata.city : null;
+  const region = typeof metadata.region === "string" ? metadata.region : null;
   return {
-    ...base,
+    id: base.id,
+    garmentId: base.garmentId,
+    imageUrl: base.imageUrl,
+    secondaryImageUrl: base.secondaryImageUrl,
+    createdAt: base.createdAt,
     captureMode,
     primaryLabel: captureMode === "front" ? "Front" : captureMode === "back" ? "Back" : "Rear",
-    secondaryLabel: base.secondaryImageUrl ? "Front" : null
+    secondaryLabel: base.secondaryImageUrl ? "Front" : null,
+    country,
+    countryCode,
+    city,
+    region,
+    metadata: { country, countryCode, city, region, captureMode }
   };
 }
 
@@ -494,6 +508,10 @@ export function registerRoutes(app: Express) {
 
       const forwarded = req.headers["x-forwarded-for"];
       const uploaderIp = Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0]?.trim() || req.ip || null;
+      const geo = lookupGeo(uploaderIp);
+      const captureLocale = bodyString(req.body.captureLocale).slice(0, 40) || null;
+      const localeCountry = countryFromLocale(captureLocale);
+      const resolvedCountry = geo.country ?? localeCountry ?? null;
       const metadata = {
         mimetype: primaryFile.mimetype,
         size: primaryFile.size,
@@ -502,6 +520,13 @@ export function registerRoutes(app: Express) {
         captureSource,
         captureMode,
         captureSide: captureSide || null,
+        captureLocale,
+        country: resolvedCountry,
+        countryCode: geo.countryCode,
+        city: geo.city,
+        region: geo.region,
+        timezone: geo.timezone,
+        geoSource: geo.country ? "ip" : localeCountry ? "locale" : null,
         publicFeed: publicFeedUpload,
         publicFeedSource: publicFeedUpload ? "picture-me-sticker" : null,
         email: publicFeedEmail,
