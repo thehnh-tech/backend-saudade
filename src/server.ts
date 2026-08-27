@@ -11,6 +11,12 @@ import { config } from "./config.js";
 import { connectDb } from "./db.js";
 import { registerRoutes } from "./routes.js";
 import { registerCheckoutRoutes, registerStripeWebhook } from "./stripeRoutes.js";
+import { registerAdminAroundRoutes } from "./around/adminAroundRoutes.js";
+import { registerAroundPhotoRoutes } from "./around/aroundPhotoRoutes.js";
+import { registerAroundRoutes } from "./around/aroundRoutes.js";
+import { startAroundJobs } from "./around/jobs.js";
+import { syncAroundIndexes } from "./around/models.js";
+import { registerAroundUserRoutes } from "./around/userRoutes.js";
 
 const app = express();
 
@@ -28,6 +34,12 @@ app.use(express.json({ limit: "1mb" }));
 registerCheckoutRoutes(app);
 registerRoutes(app);
 
+// Picture me around (additive module)
+registerAroundUserRoutes(app);
+registerAroundRoutes(app);
+registerAroundPhotoRoutes(app);
+registerAdminAroundRoutes(app);
+
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const message = err instanceof Error ? err.message : "Unexpected error";
   if (message.includes("File too large")) return res.status(413).json({ error: "PHOTO_TOO_LARGE" });
@@ -36,6 +48,14 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 });
 
 await connectDb();
+try {
+  await syncAroundIndexes();
+} catch (err) {
+  // The additive around module must never take the frozen API down: log and
+  // keep booting (the module runs degraded until the index issue is fixed).
+  console.error("[around] index sync failed — around module degraded, frozen API unaffected:", err);
+}
+startAroundJobs();
 
 app.listen(config.port, () => {
   console.log(`Saudade API listening on ${config.apiPublicUrl}`);

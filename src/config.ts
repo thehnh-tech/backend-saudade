@@ -33,6 +33,23 @@ function flag(value: string | undefined, fallback: boolean) {
   return !["false", "0", "no", "off"].includes(cleanEnvValue(value).toLowerCase());
 }
 
+function numberEnv(name: string, value: string | undefined, fallback: number) {
+  if (value === undefined || value.trim().length === 0) return fallback;
+  const parsed = Number(cleanEnvValue(value));
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    console.warn(`[config] ${name} is not a valid number. Falling back to ${fallback}.`);
+    return fallback;
+  }
+  return parsed;
+}
+
+function csvEnv(value: string | undefined) {
+  return (value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 export const config = {
   nodeEnv,
   isProduction,
@@ -67,10 +84,31 @@ export const config = {
   corsOrigins: (process.env.CORS_ORIGINS ?? "http://localhost:5173,http://localhost:8081,http://localhost:19006,http://localhost:3000,https://saudade.thehnh.tech,https://www.saudade.thehnh.tech")
     .split(",")
     .map((origin) => origin.trim())
-    .filter(Boolean)
+    .filter(Boolean),
+
+  // Picture me around
+  appleBundleId: optional("APPLE_BUNDLE_ID", process.env.APPLE_BUNDLE_ID, "tech.thehnh.saudade"),
+  googleWebClientId: process.env.GOOGLE_WEB_CLIENT_ID ? cleanEnvValue(process.env.GOOGLE_WEB_CLIENT_ID) : "",
+  googleIosClientId: process.env.GOOGLE_IOS_CLIENT_ID ? cleanEnvValue(process.env.GOOGLE_IOS_CLIENT_ID) : "",
+  aroundMinWindowMs: numberEnv("AROUND_MIN_WINDOW_MS", process.env.AROUND_MIN_WINDOW_MS, 60 * 60 * 1000),
+  aroundMaxWindowMs: numberEnv("AROUND_MAX_WINDOW_MS", process.env.AROUND_MAX_WINDOW_MS, 6 * 60 * 60 * 1000),
+  aroundDefaultWindowMs: numberEnv("AROUND_DEFAULT_WINDOW_MS", process.env.AROUND_DEFAULT_WINDOW_MS, 4 * 60 * 60 * 1000),
+  aroundRetentionMs: numberEnv("AROUND_RETENTION_MS", process.env.AROUND_RETENTION_MS, 7 * 24 * 60 * 60 * 1000),
+  presenceFreshMs: numberEnv("PRESENCE_FRESH_MS", process.env.PRESENCE_FRESH_MS, 30 * 60 * 1000),
+  joinMaxAccuracyM: numberEnv("JOIN_MAX_ACCURACY_M", process.env.JOIN_MAX_ACCURACY_M, 150),
+  joinMaxFixAgeMs: numberEnv("JOIN_MAX_FIX_AGE_MS", process.env.JOIN_MAX_FIX_AGE_MS, 60 * 1000),
+  joinMinFixSpacingMs: numberEnv("JOIN_MIN_FIX_SPACING_MS", process.env.JOIN_MIN_FIX_SPACING_MS, 8 * 1000),
+  joinMaxInterFixSpeedMps: numberEnv("JOIN_MAX_INTER_FIX_SPEED_MPS", process.env.JOIN_MAX_INTER_FIX_SPEED_MPS, 10),
+  reviewModeUserIds: csvEnv(process.env.REVIEW_MODE_USER_IDS),
+  moderationAlertEmail: process.env.MODERATION_ALERT_EMAIL ? cleanEnvValue(process.env.MODERATION_ALERT_EMAIL) : "",
+  devBypassRadius: flag(process.env.DEV_BYPASS_RADIUS, false)
 };
 
 export const stripeIsLive = config.stripeSecretKey.startsWith("sk_live_");
+
+if (config.isProduction && config.devBypassRadius) {
+  throw new Error("[config] DEV_BYPASS_RADIUS must never be enabled in production. Remove the env variable and restart.");
+}
 
 if (config.isProduction) {
   if (!config.stripeSecretKey || !config.stripeWebhookSecret) {
