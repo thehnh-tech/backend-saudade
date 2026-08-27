@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify, errors as joseErrors, type JWTVerifyOptions } from "jose";
+import { SignJWT, createRemoteJWKSet, importPKCS8, jwtVerify, errors as joseErrors, type JWTVerifyOptions } from "jose";
 import { config } from "../config.js";
 
 // Server-side verification of the identity tokens sent by the mobile app.
@@ -60,6 +60,102 @@ export async function verifyAppleIdentityToken(identityToken: string): Promise<V
     issuer: "https://appleid.apple.com",
     audience: config.appleBundleId
   });
+}
+
+// ---------------------------------------------------------------------------
+// Sign in with Apple REST API (token exchange + revocation).
+// Required by App Store Review 5.1.1(v): an app offering Sign in with Apple
+// AND account deletion must revoke the user's Apple token on deletion.
+// Every function here is best-effort: a missing configuration or an Apple-side
+// failure must NEVER block the local deletion of the account.
+// ---------------------------------------------------------------------------
+
+const APPLE_TOKEN_URL = "https://appleid.apple.com/auth/token";
+const APPLE_REVOKE_URL = "https://appleid.apple.com/auth/revoke";
+
+export function appleRestConfigured() {
+  return Boolean(config.appleTeamId && config.appleKeyId && config.applePrivateKey && config.appleBundleId);
+}
+
+// client_secret for the Apple REST API: an ES256 JWT signed with the .p8 key.
+async function appleClientSecret(): Promise<string> {
+  const key = await importPKCS8(config.applePrivateKey, "ES256");
+  return new SignJWT({})
+    .setProtectedHeader({ alg: "ES256", kid: config.appleKeyId })
+    .setIssuer(config.appleTeamId)
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .setAudience("https://appleid.apple.com")
+    .setSubject(config.appleBundleId)
+    .sign(key);
+}
+
+// Exchanges the authorization code produced by the native Sign in with Apple
+// sheet for a refresh_token, the only credential Apple accepts for revocation
+// past the 5-minute lifetime of the code. Returns null on any failure.
+export async function exchangeAppleAuthorizationCode(code: string): Promise<string | null> {
+  if (!appleRestConfigured()) return null;
+  try {
+    const body = new URLSearchParams({
+      client_id: config.appleBundleId,
+      client_secret: await appleClientSecret(),
+      code,
+      grant_type: "authorization_code"
+    });
+    const response = await fetch(APPLE_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString()
+    });
+    if (!response.ok) {
+      console.warn(`[around:apple] authorization code exchange failed (${response.status})`);
+      return null;
+    }
+    const payload = (await response.json()) as { refresh_token?: unknown };
+    return typeof payload.refresh_token === "string" && payload.refresh_token.length > 0
+      ? payload.refresh_token
+      : null;
+  } catch (error) {
+    console.warn("[around:apple] authorization code exchange failed", error);
+    return null;
+  }
+}
+
+// Revokes an Apple token. `hint` mirrors Apple's token_type_hint: we store and
+// revoke a refresh_token when the client supplied an authorization code, and
+// fall back to whatever we hold otherwise.
+export async function revokeAppleToken(
+  token: string,
+  hint: "refresh_token" | "access_token" = "refresh_token"
+): Promise<boolean> {
+  if (!token) return false;
+  if (!appleRestConfigured()) {
+    console.warn(
+      "[around:apple] APPLE_TEAM_ID / APPLE_KEY_ID / APPLE_PRIVATE_KEY are not configured: the Apple token could NOT be revoked (App Store 5.1.1(v)). Account deletion continues."
+    );
+    return false;
+  }
+  try {
+    const body = new URLSearchParams({
+      client_id: config.appleBundleId,
+      client_secret: await appleClientSecret(),
+      token,
+      token_type_hint: hint
+    });
+    const response = await fetch(APPLE_REVOKE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString()
+    });
+    if (!response.ok) {
+      console.error(`[around:apple] token revocation refused by Apple (${response.status})`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error("[around:apple] token revocation failed", error);
+    return false;
+  }
 }
 
 export async function verifyGoogleIdToken(identityToken: string): Promise<VerifiedIdentity> {

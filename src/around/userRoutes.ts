@@ -4,29 +4,55 @@ import { z } from "zod";
 import { signAuth } from "../auth.js";
 import { config } from "../config.js";
 import type { AuthedRequest } from "../types.js";
-import { locationRateLimit, oauthRateLimit, reportRateLimit } from "./aroundRateLimit.js";
+import { deviceRateLimit, locationRateLimit, oauthRateLimit, reportRateLimit } from "./aroundRateLimit.js";
 import { geoPoint } from "./models.js";
 import {
   AroundBlockModel,
   AroundDeviceModel,
   AroundMemberModel,
   AroundModel,
+  AroundReportModel,
+  AroundReservedPseudoModel,
   AroundUserModel,
   DevicePresenceModel,
+  ModerationActionModel,
   REPORT_REASONS,
+  type AroundDevice,
   type AroundUser
 } from "./models.js";
 import { invalidateUserCache, requireUser, wrap, type AroundRequest } from "./middleware.js";
 import { createReport, sendReportAlertEmail } from "./moderation.js";
-import { OAuthVerificationError, verifyAppleIdentityToken, verifyGoogleIdToken } from "./oauth.js";
+import {
+  OAuthVerificationError,
+  exchangeAppleAuthorizationCode,
+  revokeAppleToken,
+  verifyAppleIdentityToken,
+  verifyGoogleIdToken
+} from "./oauth.js";
 import { purgeUserPhotos } from "./purge.js";
 import { userResponse } from "./serializers.js";
+import { checkUserText } from "./textFilter.js";
 
 const PSEUDO_PATTERN = /^[a-zA-Z0-9._-]{3,24}$/;
+
+// The pseudo is displayed to people who never joined anything (it is the
+// `ownerPseudo` of every around card in /nearby, next to the name pushed to
+// strangers), so it goes through the same first-line filter as an around name.
+// Shape first (PSEUDO_PATTERN), content second: a caller gets INVALID_PSEUDO
+// either way, and only the content refusal carries a `reason`.
+function pseudoRefusal(pseudo: string): { error: string; reason?: string } | null {
+  if (!PSEUDO_PATTERN.test(pseudo)) return { error: "INVALID_PSEUDO" };
+  const verdict = checkUserText(pseudo, "pseudo");
+  if (!verdict.ok) return { error: "INVALID_PSEUDO", reason: verdict.reason };
+  return null;
+}
 
 const oauthSchema = z.object({
   provider: z.enum(["apple", "google"]),
   identityToken: z.string().min(10),
+  // Apple authorization code: exchanged server-side for a refresh_token, the
+  // credential needed to revoke the grant at account deletion (5.1.1(v)).
+  authorizationCode: z.string().trim().min(10).max(512).optional(),
   pseudo: z.string().trim().optional(),
   termsVersion: z.string().trim().max(40).optional()
 });
@@ -60,6 +86,16 @@ const reportSchema = z.object({
   comment: z.string().trim().max(500).optional()
 });
 
+// A pseudo is unavailable when a live account holds it OR when it is still
+// tombstoned from a deleted account (see DELETE /api/users/me).
+async function pseudoIsTaken(pseudoLower: string, excludeUserId?: Types.ObjectId) {
+  const byUser = await AroundUserModel.exists(
+    excludeUserId ? { pseudoLower, _id: { $ne: excludeUserId } } : { pseudoLower }
+  );
+  if (byUser) return true;
+  return Boolean(await AroundReservedPseudoModel.exists({ pseudoLower }));
+}
+
 function isDuplicateKeyError(error: unknown) {
   return typeof error === "object" && error !== null && (error as { code?: number }).code === 11000;
 }
@@ -68,20 +104,24 @@ function authTokenFor(user: AroundUser) {
   return signAuth({ role: "user", userId: String(user._id) });
 }
 
-async function attachProviderSub(user: AroundUser, provider: "apple" | "google", sub: string, email: string | null) {
-  const update: Record<string, unknown> = { lastSeenAt: new Date() };
-  if (provider === "apple" && !user.appleSub) update.appleSub = sub;
-  if (provider === "google" && !user.googleSub) update.googleSub = sub;
-  if (email && !user.email) update.email = email;
-  await AroundUserModel.updateOne({ _id: user._id }, { $set: update });
-  invalidateUserCache(String(user._id));
+// Best-effort capture of the Apple refresh token needed at deletion time.
+// A failed exchange must never break the login: we simply keep nothing.
+async function appleRefreshTokenFrom(provider: "apple" | "google", authorizationCode?: string) {
+  if (provider !== "apple" || !authorizationCode) return null;
+  try {
+    return await exchangeAppleAuthorizationCode(authorizationCode);
+  } catch (error) {
+    console.error("[around:apple] authorization code exchange failed", error);
+    return null;
+  }
 }
 
 export function registerAroundUserRoutes(app: Express) {
   // POST /api/users/oauth — unified Apple/Google sign-in.
-  // Lookup by (provider, sub); otherwise attach to an existing account via
-  // VERIFIED email; otherwise 2-call signup flow (PSEUDO_REQUIRED /
-  // PSEUDO_TAKEN, the client resends the same identityToken with a pseudo).
+  // Lookup by (provider, sub) ONLY; an e-mail collision is refused with 409
+  // EMAIL_ALREADY_LINKED (never silently linked); otherwise 2-call signup flow
+  // (PSEUDO_REQUIRED / PSEUDO_TAKEN, the client resends the same identityToken
+  // with a pseudo).
   app.post("/api/users/oauth", oauthRateLimit, wrap(async (req: AuthedRequest, res: Response) => {
     const parsed = oauthSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
@@ -99,36 +139,43 @@ export function registerAroundUserRoutes(app: Express) {
     }
 
     const subField = parsed.data.provider === "apple" ? "appleSub" : "googleSub";
-    let user = await AroundUserModel.findOne({ [subField]: identity.sub }).lean<AroundUser>();
+    const user = await AroundUserModel.findOne({ [subField]: identity.sub }).lean<AroundUser>();
 
     if (!user && identity.email) {
-      // Attach the new provider to an existing account matched by verified
-      // email instead of creating a duplicate.
-      user = await AroundUserModel.findOne({ email: identity.email }).lean<AroundUser>();
-      if (user) {
-        await attachProviderSub(user, parsed.data.provider, identity.sub, identity.email);
-        user = await AroundUserModel.findById(user._id).lean<AroundUser>();
-      }
+      // A "verified" e-mail only attests that the provider account controls
+      // that mailbox NOW, not that it is the same person: an expired domain or
+      // a Workspace admin would be enough to take the account over. We refuse
+      // instead of attaching the new provider sub. Cross-provider linking, if
+      // ever needed, must happen under an already authenticated session.
+      const clash = await AroundUserModel.exists({ email: identity.email });
+      if (clash) return res.status(409).json({ error: "EMAIL_ALREADY_LINKED" });
     }
 
     if (user) {
       if (user.status === "banned") return res.status(403).json({ error: "USER_BANNED" });
-      await AroundUserModel.updateOne({ _id: user._id }, { $set: { lastSeenAt: new Date() } });
+      const refreshToken = await appleRefreshTokenFrom(parsed.data.provider, parsed.data.authorizationCode);
+      await AroundUserModel.updateOne(
+        { _id: user._id },
+        { $set: { lastSeenAt: new Date(), ...(refreshToken ? { appleRefreshToken: refreshToken } : {}) } }
+      );
       return res.json({ token: authTokenFor(user), user: userResponse(user), created: false });
     }
 
     const pseudo = parsed.data.pseudo?.trim() ?? "";
     if (!pseudo) return res.status(409).json({ error: "PSEUDO_REQUIRED" });
-    if (!PSEUDO_PATTERN.test(pseudo)) return res.status(400).json({ error: "INVALID_PSEUDO" });
+    const refusal = pseudoRefusal(pseudo);
+    if (refusal) return res.status(400).json(refusal);
 
     const pseudoLower = pseudo.toLowerCase();
-    const taken = await AroundUserModel.exists({ pseudoLower });
-    if (taken) return res.status(409).json({ error: "PSEUDO_TAKEN" });
+    if (await pseudoIsTaken(pseudoLower)) return res.status(409).json({ error: "PSEUDO_TAKEN" });
+
+    const refreshToken = await appleRefreshTokenFrom(parsed.data.provider, parsed.data.authorizationCode);
 
     try {
       const now = new Date();
       const created = await AroundUserModel.create({
         [subField]: identity.sub,
+        appleRefreshToken: refreshToken,
         pseudo,
         pseudoLower,
         email: identity.email,
@@ -158,10 +205,10 @@ export function registerAroundUserRoutes(app: Express) {
 
     if (parsed.data.pseudo !== undefined) {
       const pseudo = parsed.data.pseudo.trim();
-      if (!PSEUDO_PATTERN.test(pseudo)) return res.status(400).json({ error: "INVALID_PSEUDO" });
+      const refusal = pseudoRefusal(pseudo);
+      if (refusal) return res.status(400).json(refusal);
       const pseudoLower = pseudo.toLowerCase();
-      const taken = await AroundUserModel.exists({ pseudoLower, _id: { $ne: user._id } });
-      if (taken) return res.status(409).json({ error: "PSEUDO_TAKEN" });
+      if (await pseudoIsTaken(pseudoLower, user._id)) return res.status(409).json({ error: "PSEUDO_TAKEN" });
       try {
         await AroundUserModel.updateOne({ _id: user._id }, { $set: { pseudo, pseudoLower } });
       } catch (error) {
@@ -178,13 +225,32 @@ export function registerAroundUserRoutes(app: Express) {
 
   // Device registration (upsert by installationId) + push token migration:
   // a token can only belong to one device row at a time.
-  app.put("/api/users/me/devices", requireUser, wrap(async (req: AroundRequest, res: Response) => {
+  app.put("/api/users/me/devices", requireUser, deviceRateLimit, wrap(async (req: AroundRequest, res: Response) => {
     const parsed = deviceSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
     const user = req.user as AroundUser;
     const data = parsed.data;
 
     if (data.expoPushToken) {
+      // Proof of possession. The route used to hand the token to whoever asked
+      // for it, unbinding it from every other row first: submitting someone
+      // else's expoPushToken silently redirected THEIR notifications to the
+      // attacker's account (and the notification title is attacker-controlled
+      // UGC). An Expo token belongs to an app installation, so exactly two
+      // migrations are legitimate — same user reinstalling (new installationId)
+      // and same device switching account (same installationId). A token that
+      // is neither is refused, and the current holder keeps it.
+      const holders = await AroundDeviceModel.find({ expoPushToken: data.expoPushToken }).lean<AroundDevice[]>();
+      const stolen = holders.some(
+        (holder) => String(holder.userId) !== String(user._id) && holder.installationId !== data.installationId
+      );
+      if (stolen) {
+        console.warn(
+          `[security] push token claim refused: user=${String(user._id)} installation=${data.installationId} ` +
+          "tried to claim a token bound to another user/installation"
+        );
+        return res.status(409).json({ error: "PUSH_TOKEN_CONFLICT" });
+      }
       await AroundDeviceModel.updateMany(
         { expoPushToken: data.expoPushToken, $or: [{ userId: { $ne: user._id } }, { installationId: { $ne: data.installationId } }] },
         { $unset: { expoPushToken: "" }, $set: { invalidatedAt: new Date() } }
@@ -288,11 +354,34 @@ export function registerAroundUserRoutes(app: Express) {
 
   // Account deletion (App Store 5.1.1(v)) — full cascade: photos (Cloudinary
   // first), devices, presence, blocks; memberships anonymised (audit
-  // stripped); owned arounds closed.
+  // stripped); owned arounds closed. The Sign in with Apple grant is revoked
+  // BEFORE the document is removed (that is where the refresh token lives).
   app.delete("/api/users/me", requireUser, wrap(async (req: AroundRequest, res: Response) => {
     const user = req.user as AroundUser;
     const userId = user._id;
     const now = new Date();
+
+    if (user.appleSub) {
+      // Never let an Apple-side failure block the deletion: the GDPR erasure
+      // obligation wins, the failure is logged for manual reprocessing.
+      try {
+        // req.user comes from the cached .lean() read, which excludes the
+        // select:false field — reload it explicitly.
+        const withSecret = await AroundUserModel
+          .findById(userId)
+          .select("+appleRefreshToken")
+          .lean<AroundUser>();
+        if (withSecret?.appleRefreshToken) {
+          await revokeAppleToken(withSecret.appleRefreshToken, "refresh_token");
+        } else {
+          console.warn(
+            `[around:account] no Apple refresh token stored for user ${String(userId)}: the Sign in with Apple grant could NOT be revoked (App Store 5.1.1(v)). Deletion continues.`
+          );
+        }
+      } catch (error) {
+        console.error("[around:account] apple token revoke failed", error);
+      }
+    }
 
     await purgeUserPhotos(userId);
 
@@ -313,6 +402,37 @@ export function registerAroundUserRoutes(app: Express) {
     await AroundDeviceModel.deleteMany({ userId });
     await DevicePresenceModel.deleteOne({ userId });
     await AroundBlockModel.deleteMany({ $or: [{ blockerId: userId }, { blockedId: userId }] });
+
+    // Erasure (GDPR art. 17 / nLPD). Reports filed by or against the account
+    // carried its ObjectId and a free-text comment for ever: `aroundId` is null
+    // on user reports, so the per-around purge (purge.ts) never matched them.
+    // They have no moderation value once the account is gone — a re-signup gets
+    // a brand new _id and there is no appleSub left to correlate on.
+    await AroundReportModel.deleteMany({
+      $or: [
+        { reporterId: userId },
+        { targetType: "user", targetId: userId }
+      ]
+    });
+    // The admin journal is kept (it is the evidence that a moderation decision
+    // was taken and when) but is unlinked from the deleted account.
+    await ModerationActionModel.updateMany(
+      { targetType: "user", targetId: userId },
+      { $set: { targetId: null } }
+    );
+
+    // Identity squatting: the pseudo is the ONLY name other members see, and
+    // deleting the user document freed the unique index instantly. Tombstone
+    // the pseudo for a cooling period (TTL-expired by MongoDB) so nobody can
+    // re-register it and be mistaken for the person who just left. Chosen over
+    // a soft-deleted user document because it keeps the erasure real: only the
+    // lowercased pseudo survives, with no link to the account.
+    await AroundReservedPseudoModel.updateOne(
+      { pseudoLower: user.pseudoLower },
+      { $set: { pseudoLower: user.pseudoLower, releasedAt: new Date() } },
+      { upsert: true }
+    );
+
     await AroundUserModel.deleteOne({ _id: userId });
     invalidateUserCache(String(userId));
 

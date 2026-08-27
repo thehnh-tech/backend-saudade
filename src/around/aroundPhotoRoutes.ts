@@ -5,18 +5,22 @@ import { z } from "zod";
 import { uploadImageBuffer } from "../cloudinary.js";
 import { config } from "../config.js";
 import { isSupportedImage, safeRandomId } from "../utils.js";
-import { reportRateLimit, uploadPhotoRateLimit } from "./aroundRateLimit.js";
+import { deletePhotoRateLimit, reportRateLimit, uploadPhotoRateLimit } from "./aroundRateLimit.js";
 import { requireMembership } from "./aroundRoutes.js";
 import { requireUser, wrap, type AroundRequest } from "./middleware.js";
 import { bilateralBlockSet, createReport, sendReportAlertEmail } from "./moderation.js";
 import {
+  AroundMemberModel,
   AroundModel,
   AroundPhotoModel,
   AroundUserModel,
+  CAPTURE_MODES,
   REPORT_REASONS,
   type Around,
+  type AroundMember,
   type AroundPhoto,
-  type AroundUser
+  type AroundUser,
+  type CaptureMode
 } from "./models.js";
 import { downloadUrl } from "./photoDelivery.js";
 import { destroyPhotoAssets } from "./purge.js";
@@ -24,16 +28,37 @@ import { notifyPhotoApproved } from "./push.js";
 import { aroundPhotoResponse } from "./serializers.js";
 
 // Multer config copied from the frozen routes.ts (NOT exported from it).
+// The text-field limits matter as much as fileSize: multer buffers EVERY
+// non-file field in memory before the handler runs, and express.json's 1 MB cap
+// does not apply to multipart. Without `fields`/`parts`/`fieldSize` (busboy
+// defaults: Infinity / Infinity / 1 MB) a single request could exhaust the
+// mono-process server that also serves the frozen marketplace API.
+// The legitimate client (mobile/src/services/capture.ts) sends one text field.
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024, files: 3 },
+  limits: {
+    fileSize: 8 * 1024 * 1024,
+    files: 3,
+    fields: 4,
+    fieldNameSize: 64,
+    fieldSize: 256,
+    // 3 files + 4 fields + boundary margin.
+    parts: 10
+  },
   fileFilter: (_req, file, cb) => {
     if (["image/jpeg", "image/png", "image/webp"].includes(file.mimetype)) cb(null, true);
     else cb(new Error("Unsupported image type"));
   }
 });
 
-const MAX_PHOTOS_PER_USER_PER_AROUND = 50;
+// Signed Cloudinary delivery URLs are bearer credentials (see photoDelivery.ts)
+// so no shared cache, proxy or CDN may ever retain a response that carries one.
+function noStore(res: Response) {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
+  res.set("Pragma", "no-cache");
+}
+
+export const MAX_PHOTOS_PER_USER_PER_AROUND = 50;
 
 const feedQuerySchema = z.object({
   cursor: z.string().optional(),
@@ -95,6 +120,7 @@ export function registerAroundPhotoRoutes(app: Express) {
       .map((photo) => aroundPhotoResponse(photo, around, viewerId, pseudos.get(String(photo.uploaderId)) ?? null))
       .filter((photo) => photo !== null);
 
+    noStore(res);
     return res.json({ photos: serialized, nextCursor });
   }));
 
@@ -118,15 +144,16 @@ export function registerAroundPhotoRoutes(app: Express) {
         return res.status(410).json({ error: "CAPTURE_WINDOW_CLOSED" });
       }
 
-      const uploadedCount = await AroundPhotoModel.countDocuments({ aroundId: around._id, uploaderId: user._id });
-      if (uploadedCount >= MAX_PHOTOS_PER_USER_PER_AROUND) {
-        return res.status(403).json({ error: "PHOTO_QUOTA_REACHED", details: { max: MAX_PHOTOS_PER_USER_PER_AROUND } });
-      }
-
       const files = req.files as Record<string, Express.Multer.File[]> | undefined;
       const rearFile = files?.photoRear?.[0] ?? null;
       const frontFile = files?.photoFront?.[0] ?? null;
-      const captureMode = typeof req.body?.captureMode === "string" ? req.body.captureMode : "double";
+      // Strictly bounded: the value is persisted and echoed to every member.
+      // An unknown value falls back to "double" (the strictest mode, which
+      // still requires both cameras) so the frozen web client keeps working.
+      const rawMode = typeof req.body?.captureMode === "string" ? req.body.captureMode.trim() : "";
+      const captureMode: CaptureMode = (CAPTURE_MODES as readonly string[]).includes(rawMode)
+        ? (rawMode as CaptureMode)
+        : "double";
 
       if (!rearFile) return res.status(400).json({ error: "PHOTO_REQUIRED" });
       if (captureMode === "double" && !frontFile) {
@@ -134,6 +161,24 @@ export function registerAroundPhotoRoutes(app: Express) {
       }
       if (!isSupportedImage(rearFile.buffer)) return res.status(400).json({ error: "INVALID_IMAGE" });
       if (frontFile && !isSupportedImage(frontFile.buffer)) return res.status(400).json({ error: "INVALID_IMAGE" });
+
+      // Cumulative quota: counting live documents made the cap trivially
+      // resettable (delete a photo, get a credit back), so the 50-photo limit
+      // was an instantaneous ceiling rather than a quota. The counter now lives
+      // on the membership and is claimed with a single conditional $inc — which
+      // also serialises concurrent uploads — placed after input validation (a
+      // malformed request must not cost a credit) but BEFORE any Cloudinary
+      // call. It is never decremented: not by DELETE, not by the purge job.
+      // A Cloudinary failure past this point loses one credit: deliberately
+      // fail-closed, since the alternative reopens the bypass.
+      const membership = req.membership as AroundMember;
+      const claimed = await AroundMemberModel.updateOne(
+        { _id: membership._id, uploadedTotal: { $lt: MAX_PHOTOS_PER_USER_PER_AROUND } },
+        { $inc: { uploadedTotal: 1 } }
+      );
+      if (claimed.matchedCount === 0) {
+        return res.status(403).json({ error: "PHOTO_QUOTA_REACHED", details: { max: MAX_PHOTOS_PER_USER_PER_AROUND } });
+      }
 
       const folder = `${config.cloudinaryUploadFolder}/around/${String(around._id)}`;
       const baseId = safeRandomId("apic", 10);
@@ -175,6 +220,7 @@ export function registerAroundPhotoRoutes(app: Express) {
       await AroundModel.updateOne({ _id: around._id }, { $inc: { photoCount: 1 } });
 
       const photo = created.toObject() as AroundPhoto;
+      noStore(res);
       return res.status(201).json({ photo: aroundPhotoResponse(photo, around, viewerId, user.pseudo) });
     })
   );
@@ -221,6 +267,7 @@ export function registerAroundPhotoRoutes(app: Express) {
     });
 
     const uploader = await AroundUserModel.findById(photo.uploaderId).lean<AroundUser>();
+    noStore(res);
     return res.json({ photo: aroundPhotoResponse(updated, around, String(user._id), uploader?.pseudo ?? null) });
   }));
 
@@ -241,7 +288,7 @@ export function registerAroundPhotoRoutes(app: Express) {
   }));
 
   // DELETE — uploader or owner. Cloudinary destroyed first, then Mongo.
-  app.delete("/api/arounds/:id/photos/:photoId", requireUser, requireMembership(), wrap(async (req: AroundRequest, res: Response) => {
+  app.delete("/api/arounds/:id/photos/:photoId", requireUser, requireMembership(), deletePhotoRateLimit, wrap(async (req: AroundRequest, res: Response) => {
     const photo = await loadPhoto(req, res);
     if (!photo) return;
     const around = req.around as Around;
@@ -276,6 +323,7 @@ export function registerAroundPhotoRoutes(app: Express) {
       return res.status(403).json({ error: "FORBIDDEN" });
     }
 
+    noStore(res);
     return res.json({
       rearUrl: downloadUrl(photo.rearPublicId, photo.rearFormat),
       frontUrl: photo.frontPublicId ? downloadUrl(photo.frontPublicId, photo.frontFormat ?? "jpg") : null,

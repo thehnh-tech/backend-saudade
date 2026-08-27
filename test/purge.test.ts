@@ -15,8 +15,10 @@ import {
   AroundModel,
   AroundPhotoModel,
   AroundReportModel,
+  AroundReservedPseudoModel,
   AroundUserModel,
-  DevicePresenceModel
+  DevicePresenceModel,
+  ModerationActionModel
 } from "../src/around/models.js";
 import { makeTestApp } from "./helpers/app.js";
 import { clearCollections, setupTestDb, teardownTestDb } from "./helpers/db.js";
@@ -194,5 +196,74 @@ describe("account deletion cascade (App Store 5.1.1(v))", () => {
 
     const stored = await AroundModel.findById(around._id).lean();
     expect(stored?.status).toBe("closed");
+  });
+
+  // User-targeted reports carry aroundId:null, so the per-around purge never
+  // matched them: they used to keep the ObjectIds of deleted accounts and a
+  // free-text comment for ever, against what the privacy policy promises.
+  it("erases the reports filed by or against a deleted account, and unlinks the admin journal", async () => {
+    const alice = await createUser("alice");
+    const bob = await createUser("bob");
+    const carol = await createUser("carol");
+
+    await AroundReportModel.create({
+      targetType: "user",
+      targetId: alice.user._id,
+      aroundId: null,
+      reporterId: bob.user._id,
+      reason: "harassment",
+      comment: "free text naming the reporter",
+      status: "open",
+      createdAt: new Date()
+    });
+    await AroundReportModel.create({
+      targetType: "user",
+      targetId: carol.user._id,
+      aroundId: null,
+      reporterId: alice.user._id,
+      reason: "spam",
+      comment: null,
+      status: "open",
+      createdAt: new Date()
+    });
+    await ModerationActionModel.create({
+      action: "ban_user",
+      targetType: "user",
+      targetId: alice.user._id,
+      meta: null,
+      createdAt: new Date()
+    });
+
+    const res = await request(app).delete("/api/users/me").set("Authorization", alice.auth);
+    expect(res.status).toBe(200);
+
+    expect(await AroundReportModel.countDocuments({
+      $or: [{ reporterId: alice.user._id }, { targetId: alice.user._id }]
+    })).toBe(0);
+
+    // The journal entry survives (evidence a decision was taken) but no longer
+    // points at the deleted account.
+    const journal = await ModerationActionModel.findOne({ action: "ban_user" }).lean();
+    expect(journal).not.toBeNull();
+    expect(journal?.targetId ?? null).toBeNull();
+  });
+
+  // The pseudo is the only visible identity: releasing it the instant an
+  // account is deleted let anyone re-register it and impersonate its owner.
+  it("tombstones the pseudo of a deleted account so it cannot be re-registered", async () => {
+    const alice = await createUser("ghost");
+
+    const res = await request(app).delete("/api/users/me").set("Authorization", alice.auth);
+    expect(res.status).toBe(200);
+    expect(await AroundReservedPseudoModel.countDocuments({ pseudoLower: "ghost" })).toBe(1);
+
+    // A live account cannot rename itself into the freed pseudo either.
+    const mallory = await createUser("mallory");
+    const rename = await request(app)
+      .patch("/api/users/me")
+      .set("Authorization", mallory.auth)
+      .send({ pseudo: "ghost" });
+    expect(rename.status).toBe(409);
+    expect(rename.body.error).toBe("PSEUDO_TAKEN");
   });
 });

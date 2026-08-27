@@ -5,9 +5,10 @@ vi.mock("cloudinary", async () => (await import("./helpers/mocks.js")).cloudinar
 vi.mock("../src/cloudinary.js", async () => (await import("./helpers/mocks.js")).backendCloudinaryMockFactory());
 vi.mock("expo-server-sdk", async () => (await import("./helpers/mocks.js")).expoMockFactory());
 
+import { MAX_PHOTOS_PER_USER_PER_AROUND } from "../src/around/aroundPhotoRoutes.js";
 import { resetAroundRateLimits } from "../src/around/aroundRateLimit.js";
 import { resetUserCache } from "../src/around/middleware.js";
-import { AroundPhotoModel } from "../src/around/models.js";
+import { AroundMemberModel, AroundPhotoModel } from "../src/around/models.js";
 import { makeTestApp } from "./helpers/app.js";
 import { clearCollections, setupTestDb, teardownTestDb } from "./helpers/db.js";
 import {
@@ -302,5 +303,122 @@ describe("approve / reject / download", () => {
 
     const stored = await AroundPhotoModel.findById(photo._id).lean();
     expect(stored?.status).toBe(approveRes.status === 200 ? "approved" : "rejected");
+  });
+});
+
+describe("upload input hardening", () => {
+  // The 50-photo quota used to count LIVE documents, so deleting a photo
+  // handed a credit back: the cap was an instantaneous ceiling, not a quota.
+  // It is now a monotonic counter on the membership.
+  it("counts photos ever uploaded, not live ones: deleting does not free a credit", async () => {
+    const { alice, around } = await setupCircle();
+    const membership = await AroundMemberModel.findOne({ aroundId: around._id, userId: alice.user._id });
+
+    // Start one below the cap so the test stays cheap.
+    await AroundMemberModel.updateOne(
+      { _id: membership?._id },
+      { $set: { uploadedTotal: MAX_PHOTOS_PER_USER_PER_AROUND - 1 } }
+    );
+
+    const last = await request(app)
+      .post(`/api/arounds/${around._id}/photos`)
+      .set("Authorization", alice.auth)
+      .field("captureMode", "back")
+      .attach("photoRear", jpegBuffer(), "rear.jpg");
+    expect(last.status).toBe(201);
+
+    // Free every live document AND reset the upload rate limiter: the only
+    // thing left standing between Alice and a 51st photo is the quota.
+    const removed = await request(app)
+      .delete(`/api/arounds/${around._id}/photos/${last.body.photo.id}`)
+      .set("Authorization", alice.auth);
+    expect(removed.status).toBe(200);
+    expect(await AroundPhotoModel.countDocuments({ aroundId: around._id, uploaderId: alice.user._id })).toBe(0);
+    resetAroundRateLimits();
+
+    const overQuota = await request(app)
+      .post(`/api/arounds/${around._id}/photos`)
+      .set("Authorization", alice.auth)
+      .field("captureMode", "back")
+      .attach("photoRear", jpegBuffer(), "rear.jpg");
+    expect(overQuota.status).toBe(403);
+    expect(overQuota.body.error).toBe("PHOTO_QUOTA_REACHED");
+
+    const stored = await AroundMemberModel.findOne({ aroundId: around._id, userId: alice.user._id }).lean();
+    expect(stored?.uploadedTotal).toBe(MAX_PHOTOS_PER_USER_PER_AROUND);
+  });
+
+  it("stores only enum captureMode values (an arbitrary string falls back to double)", async () => {
+    const { alice, around } = await setupCircle();
+
+    const res = await request(app)
+      .post(`/api/arounds/${around._id}/photos`)
+      .set("Authorization", alice.auth)
+      .field("captureMode", "not-a-mode")
+      .attach("photoRear", jpegBuffer(), "rear.jpg")
+      .attach("photoFront", jpegBuffer(), "front.jpg");
+
+    expect(res.status).toBe(201);
+    expect(res.body.photo.captureMode).toBe("double");
+    const stored = await AroundPhotoModel.findById(res.body.photo.id).lean();
+    expect(stored?.captureMode).toBe("double");
+  });
+
+  it("accepts the front/back single-camera modes", async () => {
+    const { alice, around } = await setupCircle();
+
+    const res = await request(app)
+      .post(`/api/arounds/${around._id}/photos`)
+      .set("Authorization", alice.auth)
+      .field("captureMode", "front")
+      .attach("photoRear", jpegBuffer(), "rear.jpg");
+
+    expect(res.status).toBe(201);
+    expect(res.body.photo.captureMode).toBe("front");
+  });
+
+  it("rejects a multipart body stuffed with text fields instead of buffering it", async () => {
+    const { alice, around } = await setupCircle();
+
+    const req = request(app)
+      .post(`/api/arounds/${around._id}/photos`)
+      .set("Authorization", alice.auth);
+    for (let i = 0; i < 40; i += 1) req.field(`filler${i}`, "y");
+    const res = await req.attach("photoRear", jpegBuffer(), "rear.jpg");
+
+    expect(res.status).toBe(413);
+    expect(res.body.error).toBe("REQUEST_TOO_LARGE");
+  });
+
+  it("rejects an oversized captureMode value instead of persisting it", async () => {
+    const { alice, around } = await setupCircle();
+
+    const res = await request(app)
+      .post(`/api/arounds/${around._id}/photos`)
+      .set("Authorization", alice.auth)
+      .field("captureMode", "x".repeat(100_000))
+      .attach("photoRear", jpegBuffer(), "rear.jpg");
+
+    expect(res.status).toBe(413);
+    expect(await AroundPhotoModel.countDocuments({ aroundId: around._id })).toBe(0);
+  });
+
+  it("never echoes a raw internal error message to the client", async () => {
+    const { alice, around } = await setupCircle();
+    const cloudinaryModule = await import("../src/cloudinary.js");
+    const spy = vi.spyOn(cloudinaryModule, "uploadImageBuffer").mockRejectedValueOnce(
+      new Error("Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET.")
+    );
+
+    const res = await request(app)
+      .post(`/api/arounds/${around._id}/photos`)
+      .set("Authorization", alice.auth)
+      .field("captureMode", "back")
+      .attach("photoRear", jpegBuffer(), "rear.jpg");
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: "INTERNAL_ERROR" });
+    expect(JSON.stringify(res.body)).not.toContain("CLOUDINARY");
+    spy.mockRestore();
   });
 });

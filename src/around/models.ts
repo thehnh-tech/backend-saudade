@@ -33,6 +33,10 @@ export type AroundUser = {
   _id: Types.ObjectId;
   appleSub?: string;
   googleSub?: string;
+  // Apple refresh token, kept ONLY to revoke the Sign in with Apple grant on
+  // account deletion (App Store 5.1.1(v)). `select: false` keeps it out of
+  // every read path (userResponse and the .lean<AroundUser>() lookups).
+  appleRefreshToken?: string | null;
   pseudo: string;
   pseudoLower: string;
   email?: string | null;
@@ -48,6 +52,7 @@ export type AroundUser = {
 const userSchema = new Schema<AroundUser>({
   appleSub: { type: String },
   googleSub: { type: String },
+  appleRefreshToken: { type: String, default: null, select: false },
   pseudo: { type: String, required: true, trim: true },
   pseudoLower: { type: String, required: true },
   email: { type: String, default: null, lowercase: true, trim: true },
@@ -64,6 +69,30 @@ userSchema.index({ appleSub: 1 }, { unique: true, sparse: true });
 userSchema.index({ googleSub: 1 }, { unique: true, sparse: true });
 userSchema.index({ pseudoLower: 1 }, { unique: true });
 userSchema.index({ email: 1 }, { sparse: true });
+
+// --- reserved pseudos (post-deletion tombstone) ----------------------------
+// The pseudo is the ONLY identity in this product: the owner of an around
+// approves photos on that basis alone. Deleting the user document released the
+// unique index immediately, so anyone could re-register the pseudo of someone
+// who just left and be taken for them. A tombstone row with a MongoDB TTL is
+// the cheapest fix that survives a restart: no change to the user document, no
+// migration, and the reservation expires on its own after the cooling period.
+
+export const PSEUDO_RESERVATION_MS = 30 * 24 * 60 * 60 * 1000;
+
+export type ReservedPseudo = {
+  _id: Types.ObjectId;
+  pseudoLower: string;
+  releasedAt: Date;
+};
+
+const reservedPseudoSchema = new Schema<ReservedPseudo>({
+  pseudoLower: { type: String, required: true },
+  releasedAt: { type: Date, required: true, default: () => new Date() }
+});
+
+reservedPseudoSchema.index({ pseudoLower: 1 }, { unique: true });
+reservedPseudoSchema.index({ releasedAt: 1 }, { expireAfterSeconds: PSEUDO_RESERVATION_MS / 1000 });
 
 // --- devices ---------------------------------------------------------------
 
@@ -190,6 +219,11 @@ export type AroundMember = {
   joinGeo?: Record<string, unknown> | null;
   suspicious: boolean;
   anonymizedAt?: Date | null;
+  // Monotonic counter of photos this member ever uploaded to this around. It
+  // is NEVER decremented (not on delete, not on purge): the per-around quota
+  // must be cumulative, otherwise deleting a photo hands back a credit and the
+  // 50-photo cap becomes an instantaneous ceiling instead of a real quota.
+  uploadedTotal: number;
   createdAt: Date;
 };
 
@@ -212,6 +246,9 @@ const memberSchema = new Schema<AroundMember>({
   joinGeo: { type: Schema.Types.Mixed, default: null },
   suspicious: { type: Boolean, required: true, default: false },
   anonymizedAt: { type: Date, default: null },
+  // `default: 0` covers the documents created before this field existed: no
+  // migration needed, they simply start their quota from zero.
+  uploadedTotal: { type: Number, required: true, default: 0 },
   createdAt: { type: Date, required: true, default: () => new Date() }
 });
 
@@ -221,6 +258,11 @@ memberSchema.index({ aroundId: 1, userId: 1 }, { unique: true });
 // Cloudinary assets are uploaded with type "authenticated"; we only ever
 // persist public_id + version (never a URL).
 
+// Closed set: the value is persisted, echoed to every member of the around and
+// read by the mobile client, so it must never be caller-controlled free text.
+export const CAPTURE_MODES = ["double", "front", "back"] as const;
+export type CaptureMode = (typeof CAPTURE_MODES)[number];
+
 export type AroundPhotoStatus = "pending" | "approved" | "rejected" | "removed_by_moderation";
 export type PurgeState = "live" | "cloudinary_deleted" | "purged";
 
@@ -229,7 +271,7 @@ export type AroundPhoto = {
   aroundId: Types.ObjectId;
   uploaderId: Types.ObjectId;
   status: AroundPhotoStatus;
-  captureMode: string;
+  captureMode: CaptureMode;
   rearPublicId: string;
   rearVersion: number;
   rearFormat: string;
@@ -255,7 +297,7 @@ const photoSchema = new Schema<AroundPhoto>({
     required: true,
     default: "pending"
   },
-  captureMode: { type: String, required: true, default: "double" },
+  captureMode: { type: String, enum: [...CAPTURE_MODES], required: true, default: "double" },
   rearPublicId: { type: String, required: true },
   rearVersion: { type: Number, required: true },
   rearFormat: { type: String, required: true, default: "jpg" },
@@ -312,9 +354,15 @@ export const REPORT_REASONS = [
 
 export type ReportReason = (typeof REPORT_REASONS)[number];
 
+// "around" targets the around itself, i.e. its NAME — the only piece of its
+// text that reaches people who never joined (it is the title/body of the push
+// announcing the around). Reporting it must therefore NOT require membership,
+// see POST /api/arounds/:id/report.
+export type ReportTargetType = "photo" | "user" | "around";
+
 export type AroundReport = {
   _id: Types.ObjectId;
-  targetType: "photo" | "user";
+  targetType: ReportTargetType;
   targetId: Types.ObjectId;
   aroundId?: Types.ObjectId | null;
   reporterId: Types.ObjectId;
@@ -325,7 +373,7 @@ export type AroundReport = {
 };
 
 const reportSchema = new Schema<AroundReport>({
-  targetType: { type: String, enum: ["photo", "user"], required: true },
+  targetType: { type: String, enum: ["photo", "user", "around"], required: true },
   targetId: { type: Schema.Types.ObjectId, required: true },
   aroundId: { type: Schema.Types.ObjectId, default: null, index: true },
   reporterId: { type: Schema.Types.ObjectId, required: true },
@@ -377,6 +425,7 @@ const moderationActionSchema = new Schema<ModerationAction>({
 // ---------------------------------------------------------------------------
 
 export const AroundUserModel = mongoose.model<AroundUser>("AroundUser", userSchema, "users");
+export const AroundReservedPseudoModel = mongoose.model<ReservedPseudo>("AroundReservedPseudo", reservedPseudoSchema, "reserved_pseudos");
 export const AroundDeviceModel = mongoose.model<AroundDevice>("AroundDevice", deviceSchema, "devices");
 export const DevicePresenceModel = mongoose.model<DevicePresence>("AroundDevicePresence", presenceSchema, "device_presences");
 export const AroundModel = mongoose.model<Around>("Around", aroundSchema, "arounds");
@@ -390,6 +439,7 @@ export const ModerationActionModel = mongoose.model<ModerationAction>("AroundMod
 export async function syncAroundIndexes() {
   await Promise.all([
     AroundUserModel.syncIndexes(),
+    AroundReservedPseudoModel.syncIndexes(),
     AroundDeviceModel.syncIndexes(),
     DevicePresenceModel.syncIndexes(),
     AroundModel.syncIndexes(),

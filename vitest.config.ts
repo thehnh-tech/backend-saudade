@@ -15,6 +15,13 @@ export default defineConfig({
       JWT_SECRET: "around-test-secret",
       MONGODB_URI: "mongodb://127.0.0.1:27017/saudade-test-unused",
       APPLE_BUNDLE_ID: "tech.thehnh.saudade",
+      // Throwaway P-256 key generated for the test suite only (never used by
+      // any Apple account). Escaped "\n" on purpose: it exercises the
+      // single-line PEM re-expansion done in config.ts.
+      APPLE_TEAM_ID: "TESTTEAMID",
+      APPLE_KEY_ID: "TESTKEYID0",
+      APPLE_PRIVATE_KEY:
+        "-----BEGIN PRIVATE KEY-----\\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtxYtlpcF3m0pv8BI\\nxHHLyiKl2on8OW8hSTJtD50ED+WhRANCAATilgdMuGgO0jbGIFwoUUkJP/JOMxik\\noo/bNUCPZzrW3z9BUNfkffYQ4jamEMM3aWJQE5v4aFMYp3xgLiCEYt4u\\n-----END PRIVATE KEY-----\\n",
       GOOGLE_WEB_CLIENT_ID: "test-google-web-client",
       GOOGLE_IOS_CLIENT_ID: "test-google-ios-client",
       AROUND_MIN_WINDOW_MS: "3600000",

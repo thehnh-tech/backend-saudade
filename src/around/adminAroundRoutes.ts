@@ -46,12 +46,18 @@ export function registerAdminAroundRoutes(app: Express) {
     const reporterIds = [...new Set(reports.map((report) => String(report.reporterId)))];
     const photoIds = reports.filter((report) => report.targetType === "photo").map((report) => report.targetId);
     const userTargetIds = reports.filter((report) => report.targetType === "user").map((report) => report.targetId);
+    const aroundTargetIds = reports.filter((report) => report.targetType === "around").map((report) => report.targetId);
 
     const photos = await AroundPhotoModel.find({ _id: { $in: photoIds } }).lean<AroundPhoto[]>();
     const photosById = new Map(photos.map((photo) => [String(photo._id), photo]));
+    // Reported arounds: the moderator needs the NAME (that is the reported
+    // content) and the owner's pseudo (that is who to ban).
+    const targetArounds = await AroundModel.find({ _id: { $in: aroundTargetIds } }).lean<Around[]>();
+    const aroundsById = new Map(targetArounds.map((around) => [String(around._id), around]));
     const uploaderIds = photos.map((photo) => String(photo.uploaderId));
+    const aroundOwnerIds = targetArounds.map((around) => String(around.ownerId));
     const users = await AroundUserModel.find({
-      _id: { $in: [...new Set([...reporterIds, ...userTargetIds.map(String), ...uploaderIds])] }
+      _id: { $in: [...new Set([...reporterIds, ...userTargetIds.map(String), ...uploaderIds, ...aroundOwnerIds])] }
     }).lean<AroundUser[]>();
     const usersById = new Map(users.map((user) => [String(user._id), user]));
 
@@ -59,6 +65,7 @@ export function registerAdminAroundRoutes(app: Express) {
       reports: reports.map((report) => {
         const photo = report.targetType === "photo" ? photosById.get(String(report.targetId)) : undefined;
         const targetUser = report.targetType === "user" ? usersById.get(String(report.targetId)) : undefined;
+        const targetAround = report.targetType === "around" ? aroundsById.get(String(report.targetId)) : undefined;
         return {
           id: String(report._id),
           targetType: report.targetType,
@@ -72,6 +79,19 @@ export function registerAdminAroundRoutes(app: Express) {
             : {}),
           ...(targetUser
             ? { user: { id: String(targetUser._id), pseudo: targetUser.pseudo, status: targetUser.status } }
+            : {}),
+          ...(targetAround
+            ? {
+              around: {
+                id: String(targetAround._id),
+                name: targetAround.name ?? null,
+                ownerId: String(targetAround.ownerId),
+                ownerPseudo: usersById.get(String(targetAround.ownerId))?.pseudo ?? "deleted",
+                status: targetAround.status,
+                memberCount: targetAround.memberCount,
+                photoCount: targetAround.photoCount
+              }
+            }
             : {})
         };
       })
@@ -175,7 +195,18 @@ export function registerAdminAroundRoutes(app: Express) {
     if (!around) return res.status(404).json({ error: "AROUND_NOT_FOUND" });
 
     const purged = await purgeAround(around);
-    await logModerationAction("around-purged", "around", around._id, { complete: purged });
+    // Terms §6: "a name that breaches these Terms is removed together with the
+    // around it names". purgeAround destroys the photos and the memberships but
+    // keeps the document for stats — with its name still on it. Clear the name
+    // here (this route IS the moderation decision) and keep the offending text
+    // in the moderation journal, which is the evidence trail.
+    if (purged && around.name) {
+      await AroundModel.updateOne({ _id: around._id }, { $set: { name: null } });
+    }
+    await logModerationAction("around-purged", "around", around._id, {
+      complete: purged,
+      name: around.name ?? null
+    });
     if (!purged) {
       return res.status(502).json({ error: "PURGE_INCOMPLETE", message: "Some assets could not be destroyed; the purge job will retry." });
     }

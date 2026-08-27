@@ -5,8 +5,11 @@ const WINDOW_MS = 10_000;
 
 export function uploadRateLimit(req: Request, res: Response, next: NextFunction) {
   const token = req.params.publicToken ?? "unknown";
-  const forwarded = req.headers["x-forwarded-for"];
-  const ip = Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0]?.trim() || req.ip || "unknown";
+  // req.ip is resolved by Express from `trust proxy: 1` (server.ts): it is the
+  // entry APPENDED BY NGINX (rightmost X-Forwarded-For hop), not the leftmost
+  // one the client injects itself. Never read the raw header here — doing so
+  // let any client pick its own rate-limit bucket.
+  const ip = req.ip || "unknown";
   const key = `${ip}:${token}`;
   const now = Date.now();
   const last = hits.get(key);

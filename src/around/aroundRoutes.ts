@@ -2,14 +2,15 @@ import type { Express, NextFunction, Response } from "express";
 import { Types, isValidObjectId } from "mongoose";
 import { z } from "zod";
 import { config } from "../config.js";
-import { createAroundRateLimit, joinRateLimit, nearbyRateLimit } from "./aroundRateLimit.js";
-import { clientIpOf, haversineMeters, joinToleranceM, verifyJoinFixes, type JoinFixInput } from "./geoUtils.js";
+import { createAroundRateLimit, joinRateLimit, nearbyRateLimit, reportRateLimit } from "./aroundRateLimit.js";
+import { clientIpOf, geoIpConsistency, haversineMeters, joinToleranceM, verifyJoinFixes, type JoinFixInput } from "./geoUtils.js";
 import { requireUser, wrap, type AroundRequest } from "./middleware.js";
-import { bilateralBlockSet } from "./moderation.js";
+import { bilateralBlockSet, createReport, sendReportAlertEmail } from "./moderation.js";
 import {
   AroundMemberModel,
   AroundModel,
   AroundUserModel,
+  REPORT_REASONS,
   geoPoint,
   type Around,
   type AroundMember,
@@ -17,8 +18,20 @@ import {
 } from "./models.js";
 import { fanOutAroundCreated } from "./push.js";
 import { aroundResponse, memberResponse } from "./serializers.js";
+import { checkUserText } from "./textFilter.js";
 
 const MAX_ACTIVE_AROUNDS_PER_OWNER = 2;
+
+// Distance granularity served to NON-members in /nearby. An exact distance
+// from a point chosen by the caller is a circle constraint: three of them
+// reconstruct the center to the meter. 50 m is enough to render a card.
+const NEARBY_DISTANCE_BUCKET_M = 50;
+
+// Same tolerance as the GeoIP consistency check of /join (geoUtils).
+const GEO_IP_MAX_DISTANCE_KM = 1000;
+
+// Must stay in sync with DEMO_PSEUDO in seedReviewAround.ts.
+const REVIEW_DEMO_OWNER_PSEUDO = "pma-demo";
 
 const createAroundSchema = z.object({
   name: z.string().trim().min(1).max(60).optional(),
@@ -46,7 +59,17 @@ const joinSchema = z.object({
   fixes: z.array(fixSchema).length(2)
 });
 
+// Same shape as the photo and user report bodies (aroundPhotoRoutes.ts,
+// userRoutes.ts) so the three report surfaces stay one contract for the client.
+const reportSchema = z.object({
+  reason: z.enum(REPORT_REASONS),
+  comment: z.string().trim().max(500).optional()
+});
+
 function isReviewModeUser(userId: string) {
+  // Fail-closed: an empty list is never a match (an all-empty CSV must not
+  // degrade into "everyone", and the check is explicit so it stays that way).
+  if (config.reviewModeUserIds.length === 0) return false;
   return config.reviewModeUserIds.includes(userId);
 }
 
@@ -100,6 +123,15 @@ export function registerAroundRoutes(app: Express) {
     const parsed = createAroundSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
     const user = req.user as AroundUser;
+
+    // The name is pushed as a notification to strangers who never joined this
+    // around (fanOutAroundCreated), so it is filtered at creation — Terms §6.
+    // The filter is a first-line guard only; the recourse for what it misses is
+    // POST /api/arounds/:id/report below, open to non-members.
+    if (parsed.data.name) {
+      const verdict = checkUserText(parsed.data.name, "aroundName");
+      if (!verdict.ok) return res.status(400).json({ error: "INVALID_NAME", reason: verdict.reason });
+    }
 
     const durationMs = parsed.data.durationH !== undefined
       ? Math.round(parsed.data.durationH * 60 * 60 * 1000)
@@ -177,6 +209,19 @@ export function registerAroundRoutes(app: Express) {
     const { lat, lng } = parsed.data;
     const accuracy = parsed.data.accuracy ?? 30;
     const now = new Date();
+    const viewerId = String(user._id);
+    const bypassGeoChecks = config.devBypassRadius || isReviewModeUser(viewerId);
+
+    // The queried point must be consistent with the caller's IP, exactly like
+    // /join. Without this, /nearby is a geolocation oracle usable from
+    // anywhere: arbitrary coordinates let a scripted client sweep a whole city
+    // and probe third-party arounds it can never reach.
+    if (!bypassGeoChecks) {
+      const { distanceKm } = geoIpConsistency(clientIpOf(req), lat, lng);
+      if (distanceKm !== null && distanceKm > GEO_IP_MAX_DISTANCE_KM) {
+        return res.status(403).json({ error: "GEO_MISMATCH", geoIpDistanceKm: Math.round(distanceKm) });
+      }
+    }
 
     const maxDistance = 300 + joinToleranceM(accuracy) + 100;
     const candidates = await AroundModel.find({
@@ -191,7 +236,6 @@ export function registerAroundRoutes(app: Express) {
     }).limit(50).lean<Around[]>();
 
     const blocked = await bilateralBlockSet(user._id);
-    const viewerId = String(user._id);
     const inRange = candidates.filter((around) => {
       if (blocked.has(String(around.ownerId))) return false;
       if (around.kickedUserIds.some((id) => String(id) === viewerId)) return false;
@@ -201,14 +245,27 @@ export function registerAroundRoutes(app: Express) {
     });
 
     let extra: Around[] = [];
-    if (isReviewModeUser(viewerId) && config.reviewModeUserIds.length > 0) {
-      const reviewOwnerIds = config.reviewModeUserIds.filter((id) => isValidObjectId(id));
-      const seen = new Set(inRange.map((around) => String(around._id)));
-      extra = (await AroundModel.find({
-        status: "active",
-        captureEndsAt: { $gt: now },
-        ownerId: { $in: reviewOwnerIds.map((id) => new Types.ObjectId(id)) }
-      }).lean<Around[]>()).filter((around) => !seen.has(String(around._id)));
+    if (isReviewModeUser(viewerId)) {
+      const ownerIds = config.reviewModeUserIds
+        .filter((id) => isValidObjectId(id))
+        .map((id) => new Types.ObjectId(id));
+      // REVIEW_MODE_USER_IDS is a list of VIEWERS. The demo around belongs to
+      // the seeded `pma-demo` account, not to the reviewer, so it has to be
+      // resolved server-side — otherwise the review account sees nothing.
+      const demoOwner = await AroundUserModel
+        .findOne({ pseudoLower: REVIEW_DEMO_OWNER_PSEUDO })
+        .lean<AroundUser>();
+      if (demoOwner && !ownerIds.some((id) => id.equals(demoOwner._id))) {
+        ownerIds.push(demoOwner._id);
+      }
+      if (ownerIds.length > 0) {
+        const seen = new Set(inRange.map((around) => String(around._id)));
+        extra = (await AroundModel.find({
+          status: "active",
+          captureEndsAt: { $gt: now },
+          ownerId: { $in: ownerIds }
+        }).lean<Around[]>()).filter((around) => !seen.has(String(around._id)));
+      }
     }
 
     const all = [...inRange, ...extra];
@@ -224,13 +281,16 @@ export function registerAroundRoutes(app: Express) {
       arounds: all.map((around) => {
         const [centerLng, centerLat] = around.center.coordinates;
         const joined = joinedIds.has(String(around._id));
-        // The exact center is only disclosed to members: non-joined callers
-        // get distanceM alone, so scripted scans cannot map third-party
-        // arounds to precise coordinates.
+        const exactM = haversineMeters(lat, lng, centerLat, centerLng);
+        // The exact center AND the exact distance are only disclosed to
+        // members. Non-joined callers get a 50 m band: enough to render the
+        // card, useless as a trilateration oracle.
         const { center, ...rest } = aroundResponse(around, {
           viewerId,
           ownerPseudo: pseudos.get(String(around.ownerId)) ?? null,
-          distanceM: Math.round(haversineMeters(lat, lng, centerLat, centerLng))
+          distanceM: joined
+            ? Math.round(exactM)
+            : Math.ceil(exactM / NEARBY_DISTANCE_BUCKET_M) * NEARBY_DISTANCE_BUCKET_M
         });
         return {
           ...rest,
@@ -294,10 +354,22 @@ export function registerAroundRoutes(app: Express) {
     if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
 
     const fixes = parsed.data.fixes as [JoinFixInput, JoinFixInput];
-    const bypassGeoChecks = config.devBypassRadius || isReviewModeUser(viewerId);
+    const reviewBypass = isReviewModeUser(viewerId);
+    const bypassGeoChecks = config.devBypassRadius || reviewBypass;
     const verdict = verifyJoinFixes(around, fixes, { ip: clientIpOf(req), bypassGeoChecks });
     if (!verdict.ok) {
       return res.status(verdict.status).json({ error: verdict.error, ...(verdict.details ?? {}) });
+    }
+    if (bypassGeoChecks) {
+      // A join with no proof of physical presence must never be silent, and
+      // must stay distinguishable from a legitimate join in the database: a
+      // REVIEW_MODE_USER_IDS entry forgotten in production is then visible in
+      // the logs and in the membership audit instead of blending in.
+      verdict.audit.suspicious = true;
+      console.warn(
+        `[around:geo-bypass] join without geo verification (${reviewBypass ? "REVIEW_MODE_USER_IDS" : "DEV_BYPASS_RADIUS"}) ` +
+        `user=${viewerId} around=${String(around._id)} ip=${clientIpOf(req) ?? "unknown"}`
+      );
     }
 
     if (existing) {
@@ -389,6 +461,47 @@ export function registerAroundRoutes(app: Express) {
       { $inc: { memberCount: -1 }, $addToSet: { kickedUserIds: targetId } }
     );
     return res.json({ ok: true });
+  }));
+
+  // POST /api/arounds/:id/report — report an around, i.e. its NAME.
+  //
+  // This is the ONE report route that must NOT require membership: the name is
+  // broadcast as a push notification to every radar-enabled stranger inside the
+  // radius, and someone who only saw that notification has no other recourse
+  // (Terms §6 promises exactly this). Authentication and a non-banned account
+  // are still required (requireUser), and the same 20/day report budget as the
+  // photo and user reports applies, so the open door is not a spam channel.
+  app.post("/api/arounds/:id/report", requireUser, reportRateLimit, wrap(async (req: AroundRequest, res: Response) => {
+    const parsed = reportSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
+    if (!isValidObjectId(req.params.id)) return res.status(404).json({ error: "AROUND_NOT_FOUND" });
+
+    const around = await AroundModel.findById(req.params.id).lean<Around>();
+    if (!around || around.status === "purged" || around.status === "purging") {
+      return res.status(404).json({ error: "AROUND_NOT_FOUND" });
+    }
+    const user = req.user as AroundUser;
+    if (String(around.ownerId) === String(user._id)) {
+      return res.status(400).json({ error: "CANNOT_REPORT_OWN_AROUND" });
+    }
+
+    const { report, created } = await createReport({
+      targetType: "around",
+      targetId: around._id,
+      aroundId: around._id,
+      reporterId: user._id,
+      reason: parsed.data.reason,
+      comment: parsed.data.comment ?? null
+    });
+    if (created) {
+      void sendReportAlertEmail(report, user.pseudo, around.name ?? null).catch((error) => {
+        console.error("[around:moderation] report alert email failed", error);
+      });
+    }
+    // 201 on the first report, and still 201 on a repeat: the unique index
+    // makes the call idempotent per (target, reporter) and the client must not
+    // be able to tell whether it already reported this around.
+    return res.status(201).json({ ok: true });
   }));
 
   // GET /api/arounds/:id — detail + member list (bilateral blocks filtered

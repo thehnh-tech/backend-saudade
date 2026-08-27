@@ -113,21 +113,42 @@ describe("POST /api/users/oauth", () => {
     expect(again.body.user.id).toBe(created.body.user.id);
   });
 
-  it("attaches a second provider to the same account via VERIFIED email", async () => {
+  it("REFUSES to link a second provider on a verified-email match (409 EMAIL_ALREADY_LINKED, no token issued)", async () => {
     mockIdentity({ sub: "apple-sub-x", email: "Party@Example.com", email_verified: "true" });
     const appleRes = await request(app)
       .post("/api/users/oauth")
       .send({ provider: "apple", identityToken: "apple-token", pseudo: "partygoer" });
     expect(appleRes.status).toBe(201);
 
+    // A verified e-mail only proves control of the mailbox now, not identity:
+    // it must never authenticate into somebody else's account.
     mockIdentity({ sub: "google-sub-y", email: "party@example.com", email_verified: true });
     const googleRes = await request(app)
       .post("/api/users/oauth")
       .send({ provider: "google", identityToken: "google-token" });
-    expect(googleRes.status).toBe(200);
-    expect(googleRes.body.created).toBe(false);
-    expect(googleRes.body.user.id).toBe(appleRes.body.user.id);
-    expect(googleRes.body.user.providers).toEqual({ apple: true, google: true });
+    expect(googleRes.status).toBe(409);
+    expect(googleRes.body.error).toBe("EMAIL_ALREADY_LINKED");
+    expect(googleRes.body.token).toBeUndefined();
+
+    // The victim account is untouched: no googleSub written, no duplicate.
+    const victim = await AroundUserModel.findById(appleRes.body.user.id).lean();
+    expect(victim?.googleSub).toBeUndefined();
+    expect(await AroundUserModel.countDocuments()).toBe(1);
+  });
+
+  it("refuses the takeover even when a pseudo is supplied (the 409 is not a signup prompt)", async () => {
+    mockIdentity({ sub: "apple-sub-victim", email: "victim@example.com", email_verified: "true" });
+    const victimRes = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "apple", identityToken: "apple-token", pseudo: "victim" });
+    expect(victimRes.status).toBe(201);
+
+    mockIdentity({ sub: "google-sub-attacker", email: "victim@example.com", email_verified: true });
+    const attacker = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "google", identityToken: "google-token", pseudo: "attacker" });
+    expect(attacker.status).toBe(409);
+    expect(attacker.body.error).toBe("EMAIL_ALREADY_LINKED");
     expect(await AroundUserModel.countDocuments()).toBe(1);
   });
 

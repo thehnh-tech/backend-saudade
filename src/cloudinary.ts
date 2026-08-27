@@ -1,4 +1,4 @@
-import { v2 as cloudinary, type UploadApiOptions, type UploadApiResponse } from "cloudinary";
+import { v2 as cloudinary, type ConfigOptions, type UploadApiOptions, type UploadApiResponse } from "cloudinary";
 import { config } from "./config.js";
 
 const cloudinaryConfigured = Boolean(
@@ -12,7 +12,14 @@ if (cloudinaryConfigured) {
     cloud_name: config.cloudinaryCloudName,
     api_key: config.cloudinaryApiKey,
     api_secret: config.cloudinaryApiSecret,
-    secure: true
+    secure: true,
+    // Only set when the token-based authentication add-on is provisioned; the
+    // SDK ignores auth_token options entirely without this key. The typings
+    // model auth_token as the per-URL shape (which requires acl/url); at the
+    // global config level only `key` is meaningful, hence the cast.
+    ...(config.cloudinaryAuthTokenKey
+      ? { auth_token: { key: config.cloudinaryAuthTokenKey } as unknown as ConfigOptions["auth_token"] }
+      : {})
   });
 }
 

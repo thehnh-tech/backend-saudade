@@ -6,7 +6,8 @@ import {
   AroundReportModel,
   ModerationActionModel,
   type AroundReport,
-  type ReportReason
+  type ReportReason,
+  type ReportTargetType
 } from "./models.js";
 
 // UGC compliance helpers (Guideline 1.2): report creation (idempotent per
@@ -20,7 +21,7 @@ function isDuplicateKeyError(error: unknown) {
 }
 
 export async function createReport(input: {
-  targetType: "photo" | "user";
+  targetType: ReportTargetType;
   targetId: Types.ObjectId;
   aroundId?: Types.ObjectId | null;
   reporterId: Types.ObjectId;
@@ -52,7 +53,10 @@ export async function createReport(input: {
 }
 
 // Fire-and-forget email alert so a human can honour the 24h moderation SLA.
-export async function sendReportAlertEmail(report: AroundReport, reporterPseudo: string) {
+// `targetLabel` carries the offending text itself when there is one (the name
+// of a reported around): without it the moderator has to open the admin panel
+// just to know what the report is about.
+export async function sendReportAlertEmail(report: AroundReport, reporterPseudo: string, targetLabel?: string | null) {
   const to = config.moderationAlertEmail || config.mailAdminBcc || config.mailReplyTo;
   if (!resend || !to) {
     console.warn("[around:moderation] Resend or alert recipient not configured. Skipping report alert email.");
@@ -64,6 +68,7 @@ export async function sendReportAlertEmail(report: AroundReport, reporterPseudo:
     "",
     `Target type: ${report.targetType}`,
     `Target id: ${String(report.targetId)}`,
+    targetLabel ? `Target text: ${targetLabel}` : "",
     report.aroundId ? `Around id: ${String(report.aroundId)}` : "",
     `Reason: ${report.reason}`,
     report.comment ? `Comment: ${report.comment}` : "",
