@@ -27,8 +27,16 @@ function required(name: string, value: string | undefined, fallback?: string) {
   return fallback ?? "";
 }
 
+// Unlike `required()`, an absent value here is not a misconfiguration: the
+// fallback is the intended production value (e.g. HOST=127.0.0.1). Warning
+// "some features will be disabled" would be plainly false — so only warn when
+// the fallback is empty, which does mean the feature is off.
 function optional(name: string, value: string | undefined, fallback: string) {
-  return required(name, value, fallback);
+  if (value && value.trim().length > 0) return cleanEnvValue(value);
+  if (isProduction && fallback === "") {
+    console.warn(`[config] ${name} is missing in production. Some features will be disabled.`);
+  }
+  return fallback;
 }
 
 // A signing secret / admin password must NEVER fall back to a constant that
@@ -80,6 +88,17 @@ export const config = {
   nodeEnv,
   isProduction,
   port: Number(process.env.PORT ?? 4000),
+  // Bind address. Express runs with `trust proxy 1`, so the client IP used by
+  // the rate limits and by the GeoIP join check is read from X-Forwarded-For.
+  // That is only trustworthy while every request goes through the reverse
+  // proxy: if the application port is reachable directly, the "trusted hop" is
+  // the caller and the value is attacker-chosen. Binding loopback in
+  // production makes that unreachable by construction, so the guarantee no
+  // longer depends on a firewall rule being right.
+  // Platforms that route to the container from outside (Vercel, Render, Fly,
+  // Railway, Docker without host networking) need the wildcard instead: set
+  // HOST=0.0.0.0 there.
+  host: optional("HOST", process.env.HOST, isProduction ? "127.0.0.1" : "0.0.0.0"),
   apiPublicUrl: required("API_PUBLIC_URL", process.env.API_PUBLIC_URL, "http://localhost:4000"),
   webPublicUrl: required("WEB_PUBLIC_URL", process.env.WEB_PUBLIC_URL, "http://localhost:5173"),
   jwtSecret: requiredSecret("JWT_SECRET", process.env.JWT_SECRET, DEV_JWT_SECRET),
