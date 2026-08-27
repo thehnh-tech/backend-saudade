@@ -53,6 +53,15 @@ try {
 }
 startAroundJobs();
 
-app.listen(config.port, () => {
-  console.log(`Saudade API listening on ${config.apiPublicUrl}`);
+app.listen(config.port, config.host, () => {
+  console.log(`Saudade API listening on ${config.host}:${config.port} (public: ${config.apiPublicUrl})`);
+  if (config.isProduction && config.host !== "127.0.0.1" && config.host !== "localhost" && config.host !== "::1") {
+    // Reachable beyond the loopback interface: X-Forwarded-For is then
+    // caller-controlled for anyone who can hit this port directly, which
+    // defeats the per-IP rate limits and the GeoIP check on join.
+    console.warn(
+      `[security] Listening on ${config.host} in production. Keep this port unreachable from the internet ` +
+        "(firewall it, or set HOST=127.0.0.1 when a reverse proxy runs on the same host)."
+    );
+  }
 });
