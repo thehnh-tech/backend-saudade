@@ -26,3 +26,7 @@ pnpm-debug.log*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local dev-only seed for the frozen legacy product (hardcoded demo credentials)
+src/seedDemo.ts
+demo-photos/

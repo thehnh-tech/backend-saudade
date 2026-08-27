@@ -1,8 +1,10 @@
 import bcrypt from "bcryptjs";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { Express, Request, Response } from "express";
 import multer from "multer";
 import QRCode from "qrcode";
 import { z } from "zod";
+import { adminLoginLockout, adminLoginRateLimit } from "./around/aroundRateLimit.js";
 import { requireRole, signAuth } from "./auth.js";
 import { cloudinaryUrl, uploadImageBuffer } from "./cloudinary.js";
 import { config } from "./config.js";
@@ -34,6 +36,17 @@ const adminLoginSchema = z.object({
   login: z.string().trim().min(1),
   password: z.string().trim().min(1)
 });
+
+// Constant-time string equality with the same semantics as `===`. Comparing
+// the SHA-256 digests (rather than the raw strings) keeps both operands the
+// same length, so neither the value nor its LENGTH leaks through the response
+// time — a plain `timingSafeEqual` guarded by a length check would still leak
+// the length of the expected secret.
+function secretEquals(candidate: string, expected: string) {
+  const a = createHash("sha256").update(candidate, "utf8").digest();
+  const b = createHash("sha256").update(expected, "utf8").digest();
+  return timingSafeEqual(a, b);
+}
 
 const clientLoginSchema = z.object({
   clientId: z.string().min(6),
@@ -262,13 +275,20 @@ export function registerRoutes(app: Express) {
     return res.json({ product: productResponse(product) });
   });
 
-  app.post("/api/admin/login", (req, res) => {
+  // Rate limit + progressive lockout only: the authentication logic and every
+  // response shape below are unchanged (see around/aroundRateLimit.ts).
+  app.post("/api/admin/login", adminLoginRateLimit, adminLoginLockout, (req, res) => {
     const parsed = adminLoginSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
-    const primaryAdmin = parsed.data.login === config.adminLogin && parsed.data.password === config.adminPassword;
-    const demoAdmin = config.demoAdminEnabled
-      && parsed.data.login === config.demoAdminLogin
-      && parsed.data.password === config.demoAdminPassword;
+    const primaryAdmin = secretEquals(parsed.data.login, config.adminLogin)
+      && secretEquals(parsed.data.password, config.adminPassword);
+    // Belt and braces: config.ts already refuses to boot with DEMO_ADMIN_ENABLED
+    // in production, so this cannot change any reachable behaviour — it only
+    // makes the demo credentials structurally unable to authenticate there.
+    const demoAdmin = !config.isProduction
+      && config.demoAdminEnabled
+      && secretEquals(parsed.data.login, config.demoAdminLogin)
+      && secretEquals(parsed.data.password, config.demoAdminPassword);
     if (!primaryAdmin && !demoAdmin) {
       return res.status(401).json({ error: "INVALID_CREDENTIALS" });
     }

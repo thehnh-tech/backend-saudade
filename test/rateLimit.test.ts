@@ -1,6 +1,16 @@
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+const { jwtVerifyMock } = vi.hoisted(() => ({ jwtVerifyMock: vi.fn() }));
+
+vi.mock("jose", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("jose")>();
+  return {
+    ...actual,
+    createRemoteJWKSet: vi.fn(() => vi.fn()),
+    jwtVerify: jwtVerifyMock
+  };
+});
 vi.mock("cloudinary", async () => (await import("./helpers/mocks.js")).cloudinaryPackageMockFactory());
 vi.mock("../src/cloudinary.js", async () => (await import("./helpers/mocks.js")).backendCloudinaryMockFactory());
 vi.mock("expo-server-sdk", async () => (await import("./helpers/mocks.js")).expoMockFactory());
@@ -26,18 +36,79 @@ beforeEach(async () => {
   await clearCollections();
   resetAroundRateLimits();
   resetUserCache();
+  jwtVerifyMock.mockReset();
 });
 
 describe("rate limiting (429 RATE_LIMITED + Retry-After)", () => {
-  it("caps POST /api/users/oauth at 10/h per IP", async () => {
-    for (let i = 0; i < 10; i += 1) {
+  it("caps FAILED POST /api/users/oauth attempts at 30/h per IP", async () => {
+    for (let i = 0; i < 30; i += 1) {
       const res = await request(app).post("/api/users/oauth").send({});
       expect(res.status).toBe(400); // invalid input, but it counts
     }
-    const eleventh = await request(app).post("/api/users/oauth").send({});
-    expect(eleventh.status).toBe(429);
-    expect(eleventh.body.error).toBe("RATE_LIMITED");
-    expect(Number(eleventh.headers["retry-after"])).toBeGreaterThan(0);
+    const thirtyFirst = await request(app).post("/api/users/oauth").send({});
+    expect(thirtyFirst.status).toBe(429);
+    expect(thirtyFirst.body.error).toBe("RATE_LIMITED");
+    expect(Number(thirtyFirst.headers["retry-after"])).toBeGreaterThan(0);
+  });
+
+  // The product scenario is a party: everyone shares the venue's NAT. A
+  // successful sign-in (and the 409 steps of the two-call signup) must not
+  // consume quota, otherwise the tenth guest locks the venue out.
+  it("does not let successful sign-ups from one NAT exhaust the OAuth quota", async () => {
+    for (let i = 0; i < 20; i += 1) {
+      jwtVerifyMock.mockResolvedValue({
+        payload: { sub: `apple-sub-nat-${i}`, aud: "tech.thehnh.saudade", iss: "https://appleid.apple.com" },
+        protectedHeader: { alg: "RS256" }
+      });
+
+      // Step 1 of the signup flow: no pseudo yet -> 409 PSEUDO_REQUIRED.
+      const first = await request(app)
+        .post("/api/users/oauth")
+        .send({ provider: "apple", identityToken: "apple-token" });
+      expect(first.status).toBe(409);
+      expect(first.body.error).toBe("PSEUDO_REQUIRED");
+
+      // Step 2: same token plus a pseudo -> 201 created.
+      const second = await request(app)
+        .post("/api/users/oauth")
+        .send({ provider: "apple", identityToken: "apple-token", pseudo: `guest${i}` });
+      expect(second.status).toBe(201);
+    }
+
+    // 40 legitimate calls later the venue is still not throttled.
+    jwtVerifyMock.mockResolvedValue({
+      payload: { sub: "apple-sub-nat-last", aud: "tech.thehnh.saudade", iss: "https://appleid.apple.com" },
+      protectedHeader: { alg: "RS256" }
+    });
+    const late = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "apple", identityToken: "apple-token", pseudo: "lastguest" });
+    expect(late.status).toBe(201);
+  });
+
+  // An IPv6 client is routinely handed a whole /64: keying on the full address
+  // let it rotate through the subnet and bypass the limit entirely.
+  it("buckets IPv6 sources by /64 so address rotation does not reset the quota", async () => {
+    for (let i = 0; i < 30; i += 1) {
+      const res = await request(app)
+        .post("/api/users/oauth")
+        .set("X-Forwarded-For", `2001:db8:1:2::${i + 1}`)
+        .send({});
+      expect(res.status).toBe(400);
+    }
+
+    const rotated = await request(app)
+      .post("/api/users/oauth")
+      .set("X-Forwarded-For", "2001:db8:1:2::ffff")
+      .send({});
+    expect(rotated.status).toBe(429);
+
+    // A genuinely different /64 is untouched.
+    const otherSubnet = await request(app)
+      .post("/api/users/oauth")
+      .set("X-Forwarded-For", "2001:db8:1:3::1")
+      .send({});
+    expect(otherSubnet.status).toBe(400);
   });
 
   it("caps POST /api/users/me/location at 1 per 30s per user", async () => {

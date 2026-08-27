@@ -18,6 +18,36 @@ import {
 
 const expo = new Expo();
 
+// Defence in depth on the ONE piece of attacker-controlled text this pipeline
+// carries: around.name. It is filtered at creation (textFilter.ts), but a
+// filter is a guard, not a guarantee, so the push layer never trusts it either.
+//
+// Two rules, and they differ on purpose:
+//  1. Length. A 60-character name is truncated to 40 before it is put anywhere
+//     in a notification, and its whitespace is collapsed (a name padded with
+//     newlines could otherwise push the body off a lock screen).
+//  2. Placement. For the three notifications that go to people who are already
+//     members (photo pending/approved, around ending) the name stays the title:
+//     they joined that around and see the name in the app anyway, and the title
+//     is what makes the notification useful.
+//     For the fan-out at creation — the only one delivered to STRANGERS who
+//     never opted into this around — the title is the neutral, constant product
+//     name and the around's name moves into the body. A hostile name then no
+//     longer renders as the bold headline of a notification on a stranger's
+//     locked screen; it reads as quoted third-party text inside a sentence the
+//     app wrote, which is what it actually is.
+const MAX_PUSH_NAME_CHARS = 40;
+const NEUTRAL_PUSH_TITLE = "Picture me around";
+
+export function pushSafeName(name?: string | null): string | null {
+  if (typeof name !== "string") return null;
+  const collapsed = name.replace(/\s+/g, " ").trim();
+  if (!collapsed) return null;
+  return collapsed.length > MAX_PUSH_NAME_CHARS
+    ? `${collapsed.slice(0, MAX_PUSH_NAME_CHARS - 1)}…`
+    : collapsed;
+}
+
 export type AroundPushType = "around-created" | "photo-pending" | "photo-approved" | "around-ending";
 
 type PushTarget = {
@@ -133,47 +163,54 @@ export async function fanOutAroundCreated(around: Around) {
     .map((user) => user._id)
     .filter((id) => !blocked.has(String(id)));
 
+  const safeName = pushSafeName(around.name);
   const targets = await pushTargetsForUsers(recipientIds);
   await sendToTargets(
     targets,
     "around-created",
-    around.name ? `${around.name}` : "Picture me around",
-    "Un around vient de s'ouvrir pres de toi. Rejoins-le tant que tu es dans le rayon.",
-    { type: "around-created", aroundId: String(around._id), ...(around.name ? { name: around.name } : {}) }
+    // Neutral title: this fan-out reaches strangers, see pushSafeName above.
+    NEUTRAL_PUSH_TITLE,
+    safeName
+      ? `"${safeName}" vient de s'ouvrir pres de toi. Rejoins-le tant que tu es dans le rayon.`
+      : "Un around vient de s'ouvrir pres de toi. Rejoins-le tant que tu es dans le rayon.",
+    { type: "around-created", aroundId: String(around._id), ...(safeName ? { name: safeName } : {}) }
   );
 }
 
 export async function notifyPhotoApproved(around: Around, uploaderId: Types.ObjectId) {
+  const safeName = pushSafeName(around.name);
   const targets = await pushTargetsForUsers([uploaderId]);
   await sendToTargets(
     targets,
     "photo-approved",
-    around.name ? `${around.name}` : "Picture me around",
+    safeName ?? NEUTRAL_PUSH_TITLE,
     "Ta photo vient d'etre debloquee pour tout le cercle.",
-    { type: "photo-approved", aroundId: String(around._id), ...(around.name ? { name: around.name } : {}) }
+    { type: "photo-approved", aroundId: String(around._id), ...(safeName ? { name: safeName } : {}) }
   );
 }
 
 export async function notifyOwnerPhotoPending(around: Around, pendingCount: number) {
+  const safeName = pushSafeName(around.name);
   const targets = await pushTargetsForUsers([around.ownerId]);
   await sendToTargets(
     targets,
     "photo-pending",
-    around.name ? `${around.name}` : "Picture me around",
+    safeName ?? NEUTRAL_PUSH_TITLE,
     `${pendingCount} photo${pendingCount > 1 ? "s" : ""} en attente d'approbation dans ton around.`,
-    { type: "photo-pending", aroundId: String(around._id), ...(around.name ? { name: around.name } : {}) }
+    { type: "photo-pending", aroundId: String(around._id), ...(safeName ? { name: safeName } : {}) }
   );
 }
 
 export async function notifyAroundEnding(around: Around) {
+  const safeName = pushSafeName(around.name);
   const members = await AroundMemberModel.find({ aroundId: around._id, status: "active" }).lean();
   const targets = await pushTargetsForUsers(members.map((member) => member.userId));
   await sendToTargets(
     targets,
     "around-ending",
-    around.name ? `${around.name}` : "Picture me around",
+    safeName ?? NEUTRAL_PUSH_TITLE,
     "Derniere demi-heure : la fenetre de capture ferme bientot.",
-    { type: "around-ending", aroundId: String(around._id), ...(around.name ? { name: around.name } : {}) }
+    { type: "around-ending", aroundId: String(around._id), ...(safeName ? { name: safeName } : {}) }
   );
 }
 

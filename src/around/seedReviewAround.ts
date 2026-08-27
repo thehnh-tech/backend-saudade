@@ -9,8 +9,9 @@ import {
 } from "./models.js";
 
 // App Store review kit: seeds (or refreshes) a permanent demo around owned by
-// a dedicated demo account. Add the printed owner id to REVIEW_MODE_USER_IDS
-// so the review account can see and join it without the geo constraint.
+// a dedicated demo account. Add the REVIEW ACCOUNT user ids to
+// REVIEW_MODE_USER_IDS so they can see and join it without the geo constraint;
+// the demo owner itself is resolved server-side by pseudo (aroundRoutes.ts).
 // Usage: npm run seed:review -w backend
 
 const DEMO_PSEUDO = "pma-demo";
@@ -42,11 +43,14 @@ async function main() {
   }
 
   const now = new Date();
-  // Effectively permanent (+10 years): the demo around is written directly
-  // through Mongoose, and the schema imposes no bound on captureEndsAt (the
-  // 1h-6h limit only exists in the HTTP route). The minute tick therefore
-  // never closes it, and the purge job never reaches it.
-  const captureEndsAt = new Date(now.getTime() + 10 * 365 * 24 * 60 * 60 * 1000);
+  // The demo around uses the SAME upper bound a real user can pick (6 h by
+  // default). Writing a longer window would make the review build display
+  // "capture open for 3652 more days", contradicting what the App Store
+  // listing, around-terms and around-privacy promise (1-6 h window, deletion
+  // at D+7) — a discrepancy a reviewer reads as a false claim. The trade-off
+  // is that this script must be re-run on the day of the review session; it
+  // is idempotent and simply reopens the window (see docs/APP-REVIEW-NOTES.md).
+  const captureEndsAt = new Date(now.getTime() + config.aroundMaxWindowMs);
   const expiresAt = new Date(captureEndsAt.getTime() + config.aroundRetentionMs);
 
   let around = await AroundModel.findOne({ ownerId: owner._id, status: "active" }).lean();
@@ -88,7 +92,7 @@ async function main() {
   }
 
   console.log(`[seed:review] demo owner id: ${String(owner._id)}`);
-  console.log("[seed:review] add the review account user ids (and optionally this owner id) to REVIEW_MODE_USER_IDS.");
+  console.log("[seed:review] add ONLY the review account user ids to REVIEW_MODE_USER_IDS — the demo around owned by pma-demo is resolved server-side.");
   console.log("[seed:review] the demo around is effectively permanent (+10 years); re-running simply refreshes it.");
   await mongoose.disconnect();
 }

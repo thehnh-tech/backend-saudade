@@ -9,6 +9,7 @@ type HelmetMiddleware = (
 const helmet = helmetDefault as unknown as HelmetMiddleware;
 import { config } from "./config.js";
 import { connectDb } from "./db.js";
+import { aroundErrorHandler } from "./errorHandler.js";
 import { registerRoutes } from "./routes.js";
 import { registerCheckoutRoutes, registerStripeWebhook } from "./stripeRoutes.js";
 import { registerAdminAroundRoutes } from "./around/adminAroundRoutes.js";
@@ -40,12 +41,7 @@ registerAroundRoutes(app);
 registerAroundPhotoRoutes(app);
 registerAdminAroundRoutes(app);
 
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  const message = err instanceof Error ? err.message : "Unexpected error";
-  if (message.includes("File too large")) return res.status(413).json({ error: "PHOTO_TOO_LARGE" });
-  if (message.includes("Unsupported image type")) return res.status(400).json({ error: "UNSUPPORTED_IMAGE_TYPE" });
-  return res.status(500).json({ error: "INTERNAL_ERROR", message });
-});
+app.use(aroundErrorHandler);
 
 await connectDb();
 try {
