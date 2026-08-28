@@ -1,10 +1,11 @@
 import type { Express, Response } from "express";
 import { Types, isValidObjectId } from "mongoose";
 import { z } from "zod";
-import { signAuth } from "../auth.js";
 import { config } from "../config.js";
 import type { AuthedRequest } from "../types.js";
 import { deviceRateLimit, locationRateLimit, oauthRateLimit, reportRateLimit } from "./aroundRateLimit.js";
+import { purgeEmailVerifications, registerEmailAuthRoutes } from "./emailAuth.js";
+import { authTokenFor, isDuplicateKeyError, pseudoIsTaken, pseudoRefusal } from "./identity.js";
 import { geoPoint } from "./models.js";
 import {
   AroundBlockModel,
@@ -15,6 +16,7 @@ import {
   AroundReservedPseudoModel,
   AroundUserModel,
   DevicePresenceModel,
+  LOCALES,
   ModerationActionModel,
   REPORT_REASONS,
   type AroundDevice,
@@ -31,21 +33,6 @@ import {
 } from "./oauth.js";
 import { purgeUserPhotos } from "./purge.js";
 import { userResponse } from "./serializers.js";
-import { checkUserText } from "./textFilter.js";
-
-const PSEUDO_PATTERN = /^[a-zA-Z0-9._-]{3,24}$/;
-
-// The pseudo is displayed to people who never joined anything (it is the
-// `ownerPseudo` of every around card in /nearby, next to the name pushed to
-// strangers), so it goes through the same first-line filter as an around name.
-// Shape first (PSEUDO_PATTERN), content second: a caller gets INVALID_PSEUDO
-// either way, and only the content refusal carries a `reason`.
-function pseudoRefusal(pseudo: string): { error: string; reason?: string } | null {
-  if (!PSEUDO_PATTERN.test(pseudo)) return { error: "INVALID_PSEUDO" };
-  const verdict = checkUserText(pseudo, "pseudo");
-  if (!verdict.ok) return { error: "INVALID_PSEUDO", reason: verdict.reason };
-  return null;
-}
 
 const oauthSchema = z.object({
   provider: z.enum(["apple", "google"]),
@@ -58,7 +45,10 @@ const oauthSchema = z.object({
 });
 
 const patchMeSchema = z.object({
-  pseudo: z.string().trim().optional()
+  pseudo: z.string().trim().optional(),
+  // The interface language lives on the account, not on the device: it is
+  // picked at sign-up and follows the user from one install to the next.
+  locale: z.enum(LOCALES).optional()
 }).refine((value) => Object.keys(value).length > 0, { message: "Provide at least one field to update." });
 
 const deviceSchema = z.object({
@@ -86,24 +76,6 @@ const reportSchema = z.object({
   comment: z.string().trim().max(500).optional()
 });
 
-// A pseudo is unavailable when a live account holds it OR when it is still
-// tombstoned from a deleted account (see DELETE /api/users/me).
-async function pseudoIsTaken(pseudoLower: string, excludeUserId?: Types.ObjectId) {
-  const byUser = await AroundUserModel.exists(
-    excludeUserId ? { pseudoLower, _id: { $ne: excludeUserId } } : { pseudoLower }
-  );
-  if (byUser) return true;
-  return Boolean(await AroundReservedPseudoModel.exists({ pseudoLower }));
-}
-
-function isDuplicateKeyError(error: unknown) {
-  return typeof error === "object" && error !== null && (error as { code?: number }).code === 11000;
-}
-
-function authTokenFor(user: AroundUser) {
-  return signAuth({ role: "user", userId: String(user._id) });
-}
-
 // Best-effort capture of the Apple refresh token needed at deletion time.
 // A failed exchange must never break the login: we simply keep nothing.
 async function appleRefreshTokenFrom(provider: "apple" | "google", authorizationCode?: string) {
@@ -117,6 +89,10 @@ async function appleRefreshTokenFrom(provider: "apple" | "google", authorization
 }
 
 export function registerAroundUserRoutes(app: Express) {
+  // POST /api/users/email/{register,verify,resend,login} — e-mail sign-up.
+  // Coexists with Sign in with Apple below; see around/emailAuth.ts.
+  registerEmailAuthRoutes(app);
+
   // POST /api/users/oauth — unified Apple/Google sign-in.
   // Lookup by (provider, sub) ONLY; an e-mail collision is refused with 409
   // EMAIL_ALREADY_LINKED (never silently linked); otherwise 2-call signup flow
@@ -215,6 +191,11 @@ export function registerAroundUserRoutes(app: Express) {
         if (isDuplicateKeyError(error)) return res.status(409).json({ error: "PSEUDO_TAKEN" });
         throw error;
       }
+      invalidateUserCache(String(user._id));
+    }
+
+    if (parsed.data.locale !== undefined) {
+      await AroundUserModel.updateOne({ _id: user._id }, { $set: { locale: parsed.data.locale } });
       invalidateUserCache(String(user._id));
     }
 
@@ -402,6 +383,11 @@ export function registerAroundUserRoutes(app: Express) {
     await AroundDeviceModel.deleteMany({ userId });
     await DevicePresenceModel.deleteOne({ userId });
     await AroundBlockModel.deleteMany({ $or: [{ blockerId: userId }, { blockedId: userId }] });
+    // A pending verification code outlives nothing: it carries the (lowercased)
+    // address of a deleted account and, if the address were re-registered
+    // before the TTL swept it, /verify would still match the old document and
+    // hand a token for a user that no longer exists.
+    await purgeEmailVerifications(userId, user.email);
 
     // Erasure (GDPR art. 17 / nLPD). Reports filed by or against the account
     // carried its ObjectId and a free-text comment for ever: `aroundId` is null

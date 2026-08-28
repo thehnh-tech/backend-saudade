@@ -4,10 +4,17 @@ import { signedBlurUrl, signedClearUrl } from "./photoDelivery.js";
 // Central serialisers. aroundPhotoResponse is the ONLY place that decides
 // clear vs blurred delivery — routes never build photo URLs themselves.
 
+// The e-mail address itself is deliberately absent, as is passwordHash (which
+// is `select: false` and so never even reaches here): the client only needs to
+// know WHETHER the mailbox is proven, and the address is already something the
+// user typed. `locale` defaults to "fr" for the accounts created before the
+// field existed.
 export function userResponse(user: AroundUser) {
   return {
     id: String(user._id),
     pseudo: user.pseudo,
+    locale: user.locale ?? "fr",
+    emailVerified: Boolean(user.emailVerifiedAt),
     radarEnabled: user.radarEnabled,
     status: user.status,
     termsAcceptedAt: user.termsAcceptedAt?.toISOString() ?? null,

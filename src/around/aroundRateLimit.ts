@@ -46,6 +46,21 @@ export function userKey(req: AuthedRequest) {
   return req.auth?.userId ? `user:${req.auth.userId}` : ipKey(req);
 }
 
+// Key of the e-mail auth limiters. The unauthenticated e-mail routes have no
+// userId, and keying them on the IP alone would let one attacker hammer every
+// mailbox they can think of from a single address (and would let a whole NAT
+// lock one another out). The body is already parsed by express.json() when the
+// limiter runs, so the target address is available; it is normalised exactly
+// like emailAuth.ts normalises it, otherwise "A@X.com" and "a@x.com" would get
+// two separate budgets. A missing or malformed field falls back to the IP so a
+// junk body can never be free.
+export function emailKey(req: AuthedRequest) {
+  const raw = (req.body as { email?: unknown } | undefined)?.email;
+  if (typeof raw !== "string") return ipKey(req);
+  const normalized = raw.trim().toLowerCase();
+  return normalized ? `email:${normalized}` : ipKey(req);
+}
+
 const registry: { reset: () => void }[] = [];
 
 export function makeRateLimit(options: {
@@ -213,6 +228,36 @@ export const deletePhotoRateLimit = makeRateLimit({ windowMs: 10 * 1000, max: 3,
 export const reportRateLimit = makeRateLimit({ windowMs: 24 * 60 * 60 * 1000, max: 20, keyFn: userKey });
 export const nearbyRateLimit = makeRateLimit({ windowMs: 60 * 1000, max: 15, keyFn: userKey });
 export const deviceRateLimit = makeRateLimit({ windowMs: 60 * 1000, max: 10, keyFn: userKey });
+
+// E-mail sign-up / sign-in (around/emailAuth.ts).
+//
+// Registration is keyed on the IP: the address in the body is attacker-chosen,
+// so keying the creation of accounts on it would cap nothing. 5/h/IP is well
+// above a real person signing up and well below a mailbox-bombing campaign.
+//
+// Verification, resend and the login lockout are keyed on the E-MAIL instead:
+// they are attacks against one specific account, and the attacker can change
+// IP far more easily than they can change which mailbox holds the code.
+// verify 10/15 min caps the 6-digit guessing at ~40 tries an hour on top of the
+// 5-attempt invalidation of the code itself.
+export const emailRegisterRateLimit = makeRateLimit({ windowMs: 60 * 60 * 1000, max: 5, keyFn: ipKey });
+export const emailVerifyRateLimit = makeRateLimit({ windowMs: 15 * 60 * 1000, max: 10, keyFn: emailKey });
+// Mounted BEFORE emailResendRateLimit so a request rejected by the 60s cooldown
+// does not also burn one of the 5 hourly sends: a user tapping "resend" twice
+// keeps their five real sends.
+export const emailResendCooldown = makeRateLimit({ windowMs: 60 * 1000, max: 1, keyFn: emailKey });
+export const emailResendRateLimit = makeRateLimit({ windowMs: 60 * 60 * 1000, max: 5, keyFn: emailKey });
+export const emailLoginRateLimit = makeRateLimit({ windowMs: 15 * 60 * 1000, max: 10, keyFn: ipKey });
+// Password guessing is per-account, so the lockout counts consecutive 401s on
+// the e-mail. 5 in a row => 5 min, doubling to 1 h. A 403 (EMAIL_NOT_VERIFIED,
+// which is only reachable with the RIGHT password) neither arms nor clears it.
+export const emailLoginLockout = makeProgressiveLockout({
+  keyFn: emailKey,
+  threshold: 5,
+  baseLockMs: 5 * 60 * 1000,
+  maxLockMs: 60 * 60 * 1000,
+  decayMs: 60 * 60 * 1000
+});
 
 // Admin auth. A single static shared password guards the whole moderation
 // surface, so this route gets both a strict window (5 tries / 15 min / IP) and
