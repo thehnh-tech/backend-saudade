@@ -29,6 +29,12 @@ export function geoPoint(lat: number, lng: number): GeoPoint {
 
 // --- users -----------------------------------------------------------------
 
+// The interface language, chosen by the user when the account is created and
+// stored server-side so every device of that account (and every e-mail we send
+// them) speaks the same language.
+export const LOCALES = ["fr", "en"] as const;
+export type AroundLocale = (typeof LOCALES)[number];
+
 export type AroundUser = {
   _id: Types.ObjectId;
   appleSub?: string;
@@ -40,6 +46,16 @@ export type AroundUser = {
   pseudo: string;
   pseudoLower: string;
   email?: string | null;
+  // bcrypt digest of the password of an e-mail account (cost 12). NEVER the
+  // password itself — the plaintext is read from the request body, hashed and
+  // dropped. `select: false` for the same reason as appleRefreshToken: it must
+  // not ride along the .lean<AroundUser>() read that feeds req.user, and from
+  // there userResponse. Absent on an Apple-only account.
+  passwordHash?: string | null;
+  // Null until the 6-digit code sent to that mailbox has been entered. An
+  // account with a passwordHash and no emailVerifiedAt cannot log in.
+  emailVerifiedAt?: Date | null;
+  locale: AroundLocale;
   radarEnabled: boolean;
   status: "active" | "banned";
   termsAcceptedAt: Date;
@@ -56,6 +72,9 @@ const userSchema = new Schema<AroundUser>({
   pseudo: { type: String, required: true, trim: true },
   pseudoLower: { type: String, required: true },
   email: { type: String, default: null, lowercase: true, trim: true },
+  passwordHash: { type: String, default: null, select: false },
+  emailVerifiedAt: { type: Date, default: null },
+  locale: { type: String, enum: [...LOCALES], required: true, default: "fr" },
   radarEnabled: { type: Boolean, required: true, default: false },
   status: { type: String, enum: ["active", "banned"], required: true, default: "active" },
   termsAcceptedAt: { type: Date, required: true },
@@ -68,7 +87,21 @@ const userSchema = new Schema<AroundUser>({
 userSchema.index({ appleSub: 1 }, { unique: true, sparse: true });
 userSchema.index({ googleSub: 1 }, { unique: true, sparse: true });
 userSchema.index({ pseudoLower: 1 }, { unique: true });
-userSchema.index({ email: 1 }, { sparse: true });
+// The e-mail became an identity the day POST /api/users/email/login existed, so
+// it must be unique. `sparse: true` alone would NOT do: a sparse index still
+// indexes an explicit `null`, and every account created through Sign in with
+// Apple stores `email: null` (Apple only hands the address on the very first
+// authorization, and the user may hide it behind a private relay). A unique
+// sparse index would therefore refuse the second Apple account ever created.
+// A PARTIAL index on the string type indexes real addresses only and leaves
+// every null out of the constraint. Case-insensitivity comes from the
+// `lowercase: true` setter above plus the explicit normalisation done in
+// emailAuth.ts, so no collation is involved — which also means the ordinary
+// `findOne({ email })` lookups keep using this index.
+userSchema.index(
+  { email: 1 },
+  { unique: true, partialFilterExpression: { email: { $type: "string" } } }
+);
 
 // --- reserved pseudos (post-deletion tombstone) ----------------------------
 // The pseudo is the ONLY identity in this product: the owner of an around
@@ -93,6 +126,46 @@ const reservedPseudoSchema = new Schema<ReservedPseudo>({
 
 reservedPseudoSchema.index({ pseudoLower: 1 }, { unique: true });
 reservedPseudoSchema.index({ releasedAt: 1 }, { expireAfterSeconds: PSEUDO_RESERVATION_MS / 1000 });
+
+// --- email_verifications ---------------------------------------------------
+// One live code per account (unique index on userId, the document is upserted
+// on every send and DELETED on success, on expiry and on the 5th wrong try).
+// The code itself is never stored: only a keyed digest, see emailAuth.ts.
+
+export const EMAIL_CODE_TTL_MS = 15 * 60 * 1000;
+export const EMAIL_CODE_MAX_ATTEMPTS = 5;
+
+export type EmailVerification = {
+  _id: Types.ObjectId;
+  userId: Types.ObjectId;
+  emailLower: string;
+  // HMAC-SHA256 digest, hex. Salt is per-code and public; the key is a
+  // server-side pepper that never reaches the database.
+  codeHash: string;
+  codeSalt: string;
+  attempts: number;
+  expiresAt: Date;
+  sentAt: Date;
+  createdAt: Date;
+};
+
+const emailVerificationSchema = new Schema<EmailVerification>({
+  userId: { type: Schema.Types.ObjectId, required: true },
+  emailLower: { type: String, required: true },
+  codeHash: { type: String, required: true },
+  codeSalt: { type: String, required: true },
+  attempts: { type: Number, required: true, default: 0 },
+  expiresAt: { type: Date, required: true },
+  sentAt: { type: Date, required: true, default: () => new Date() },
+  createdAt: { type: Date, required: true, default: () => new Date() }
+});
+
+emailVerificationSchema.index({ userId: 1 }, { unique: true });
+emailVerificationSchema.index({ emailLower: 1 });
+// expireAfterSeconds: 0 means "delete once expiresAt is in the past". Belt and
+// braces: every read path re-checks the expiry itself, because MongoDB only
+// sweeps once a minute (and mongodb-memory-server may not sweep at all).
+emailVerificationSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 // --- devices ---------------------------------------------------------------
 
@@ -426,6 +499,7 @@ const moderationActionSchema = new Schema<ModerationAction>({
 
 export const AroundUserModel = mongoose.model<AroundUser>("AroundUser", userSchema, "users");
 export const AroundReservedPseudoModel = mongoose.model<ReservedPseudo>("AroundReservedPseudo", reservedPseudoSchema, "reserved_pseudos");
+export const EmailVerificationModel = mongoose.model<EmailVerification>("AroundEmailVerification", emailVerificationSchema, "email_verifications");
 export const AroundDeviceModel = mongoose.model<AroundDevice>("AroundDevice", deviceSchema, "devices");
 export const DevicePresenceModel = mongoose.model<DevicePresence>("AroundDevicePresence", presenceSchema, "device_presences");
 export const AroundModel = mongoose.model<Around>("Around", aroundSchema, "arounds");
@@ -440,6 +514,7 @@ export async function syncAroundIndexes() {
   await Promise.all([
     AroundUserModel.syncIndexes(),
     AroundReservedPseudoModel.syncIndexes(),
+    EmailVerificationModel.syncIndexes(),
     AroundDeviceModel.syncIndexes(),
     DevicePresenceModel.syncIndexes(),
     AroundModel.syncIndexes(),
