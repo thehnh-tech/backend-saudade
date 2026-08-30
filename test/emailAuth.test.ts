@@ -1,3 +1,5 @@
+import bcrypt from "bcryptjs";
+import { createHmac } from "node:crypto";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -23,7 +25,13 @@ vi.mock("expo-server-sdk", async () => (await import("./helpers/mocks.js")).expo
 
 import { resetAroundRateLimits } from "../src/around/aroundRateLimit.js";
 import { resetUserCache } from "../src/around/middleware.js";
-import { AroundUserModel, EmailVerificationModel, type AroundUser } from "../src/around/models.js";
+import {
+  AroundUserModel,
+  EmailVerificationModel,
+  PendingSignupModel,
+  type AroundUser,
+  type PendingSignup
+} from "../src/around/models.js";
 import { config } from "../src/config.js";
 import { makeTestApp } from "./helpers/app.js";
 import { clearCollections, setupTestDb, teardownTestDb } from "./helpers/db.js";
@@ -81,8 +89,12 @@ async function storedUser(email = EMAIL) {
   return AroundUserModel.findOne({ email }).select("+passwordHash").lean<AroundUser>();
 }
 
+async function pendingSignup(email = EMAIL) {
+  return PendingSignupModel.findOne({ emailLower: email }).lean<PendingSignup>();
+}
+
 describe("POST /api/users/email/register", () => {
-  it("creates an unverified account, mails a 6-digit code and issues NO token", async () => {
+  it("stores a pending signup, mails a 6-digit code, and creates NO user and NO token", async () => {
     const res = await register();
 
     expect(res.status).toBe(201);
@@ -99,17 +111,21 @@ describe("POST /api/users/email/register", () => {
     expect(lastMail().subject).toBe("Your verification code");
     expect(lastCode()).toMatch(/^\d{6}$/);
 
-    const user = await storedUser();
-    expect(user?.emailVerifiedAt ?? null).toBeNull();
-    expect(user?.locale).toBe("en");
+    // Nothing in `users` until the mailbox is proven: the whole signup waits
+    // in pending_signups, hash included.
+    expect(await storedUser()).toBeNull();
+    expect(await AroundUserModel.countDocuments()).toBe(0);
+
+    const pending = await pendingSignup();
+    expect(pending?.pseudo).toBe("nightowl");
+    expect(pending?.locale).toBe("en");
     // The password is hashed, never stored, never echoed.
-    expect(user?.passwordHash).toBeTruthy();
-    expect(user?.passwordHash).not.toBe(PASSWORD);
-    expect(user?.passwordHash?.startsWith("$2")).toBe(true);
-    expect(JSON.stringify(user)).not.toContain(PASSWORD);
+    expect(pending?.passwordHash).toBeTruthy();
+    expect(pending?.passwordHash).not.toBe(PASSWORD);
+    expect(pending?.passwordHash?.startsWith("$2")).toBe(true);
+    expect(JSON.stringify(pending)).not.toContain(PASSWORD);
 
     // Only the digest of the code is persisted.
-    const pending = await EmailVerificationModel.findOne({ emailLower: EMAIL }).lean();
     expect(pending?.codeHash).toBeTruthy();
     expect(pending?.codeHash).not.toBe(lastCode());
     expect(pending?.attempts).toBe(0);
@@ -120,28 +136,34 @@ describe("POST /api/users/email/register", () => {
     expect(res.status).toBe(201);
     expect(lastMail().subject).toBe("Votre code de verification");
 
-    const user = await storedUser("jour@example.com");
-    expect(user?.locale).toBe("fr");
+    const pending = await pendingSignup("jour@example.com");
+    expect(pending?.locale).toBe("fr");
   });
 
   it("normalises the address (trim + lowercase) and matches it case-insensitively", async () => {
     const res = await register({ email: "  NightOwl@Example.COM " });
     expect(res.status).toBe(201);
     expect(res.body.email).toBe("nightowl@example.com");
-    expect(await storedUser("nightowl@example.com")).toBeTruthy();
+    expect(await pendingSignup("nightowl@example.com")).toBeTruthy();
 
-    // The same address in another case is the SAME account: no second one.
+    // The same address in another case is the SAME pending signup: no second
+    // one, and still no user at all.
     const again = await register({ email: "NIGHTOWL@EXAMPLE.COM", pseudo: "someoneelse" });
     expect(again.status).toBe(201);
-    expect(await AroundUserModel.countDocuments()).toBe(1);
+    expect(await PendingSignupModel.countDocuments()).toBe(1);
+    expect(await AroundUserModel.countDocuments()).toBe(0);
   });
 
-  it("rejects a password shorter than 10 characters with 400 INVALID_INPUT", async () => {
-    const res = await register({ password: "short1234" });
+  it("rejects a password shorter than 8 characters with 400 INVALID_INPUT", async () => {
+    const res = await register({ password: "short12" });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("INVALID_INPUT");
-    expect(await AroundUserModel.countDocuments()).toBe(0);
+    expect(await PendingSignupModel.countDocuments()).toBe(0);
     expect(sentEmails).toHaveLength(0);
+
+    // Exactly 8 is the floor, and it passes.
+    const atFloor = await register({ password: "12345678" });
+    expect(atFloor.status).toBe(201);
   });
 
   it("rejects a password longer than 200 characters", async () => {
@@ -170,11 +192,19 @@ describe("POST /api/users/email/register", () => {
     expect(sentEmails).toHaveLength(0);
   });
 
-  it("refuses a pseudo already taken (that leaks nothing about any address)", async () => {
+  it("lets several accounts share the same public name", async () => {
+    // The name on an existing account is no obstacle: names are display-only,
+    // identity is the userId.
     await createUser("nightowl");
     const res = await register();
-    expect(res.status).toBe(409);
-    expect(res.body.error).toBe("PSEUDO_TAKEN");
+    expect(res.status).toBe(201);
+
+    const verified = await request(app)
+      .post("/api/users/email/verify")
+      .send({ email: EMAIL, code: lastCode() });
+    expect(verified.status).toBe(200);
+    expect(verified.body.user.pseudo).toBe("nightowl");
+    expect(await AroundUserModel.countDocuments({ pseudoLower: "nightowl" })).toBe(2);
   });
 });
 
@@ -189,9 +219,42 @@ describe("anti-enumeration", () => {
     expect(second.body).toEqual(first.body);
     expect(second.body.token).toBeUndefined();
 
-    // And nothing was created behind it.
-    expect(await AroundUserModel.countDocuments()).toBe(1);
-    expect((await storedUser())?.pseudo).toBe("nightowl");
+    // And still no user behind it — one pending signup whose PAYLOAD is
+    // untouchable while its code lives: the code in the mailbox must always
+    // create the signup that requested it, or the second writer could slip
+    // their own password under the first one's code.
+    expect(await AroundUserModel.countDocuments()).toBe(0);
+    expect(await PendingSignupModel.countDocuments()).toBe(1);
+    expect((await pendingSignup())?.pseudo).toBe("nightowl");
+  });
+
+  it("never lets a re-register swap its password under the first signup's code", async () => {
+    // The takeover this guards against: victim registers, attacker re-registers
+    // the same address with their own password inside the code window, victim
+    // types the code from their mailbox. The account must carry the VICTIM's
+    // password.
+    await register();
+    const victimCode = lastCode();
+    const victimHash = (await pendingSignup())?.passwordHash;
+
+    const attacker = await register({ pseudo: "attacker", password: "attacker-pass-1" });
+    expect(attacker.status).toBe(201);
+    expect((await pendingSignup())?.passwordHash).toBe(victimHash);
+
+    const verified = await request(app)
+      .post("/api/users/email/verify")
+      .send({ email: EMAIL, code: victimCode });
+    expect(verified.status).toBe(200);
+    expect(verified.body.user.pseudo).toBe("nightowl");
+
+    const asVictim = await request(app)
+      .post("/api/users/email/login")
+      .send({ email: EMAIL, password: PASSWORD });
+    expect(asVictim.status).toBe(200);
+    const asAttacker = await request(app)
+      .post("/api/users/email/login")
+      .send({ email: EMAIL, password: "attacker-pass-1" });
+    expect(asAttacker.status).toBe(401);
   });
 
   it("answers the same for an address owned by an Apple account, and warns the mailbox", async () => {
@@ -209,9 +272,10 @@ describe("anti-enumeration", () => {
       expiresInSeconds: 900
     });
 
-    // No account was created for the impostor, and no code was issued for the
+    // No account and no pending signup for the impostor, and no code for the
     // Apple account (a code there would be a takeover, not a verification).
-    expect(await AroundUserModel.countDocuments()).toBe(2);
+    expect(await AroundUserModel.countDocuments()).toBe(1);
+    expect(await PendingSignupModel.countDocuments({ emailLower: "taken@example.com" })).toBe(0);
     expect(await EmailVerificationModel.countDocuments({ emailLower: "taken@example.com" })).toBe(0);
 
     // What differs is only what lands in the mailbox, in the OWNER's language.
@@ -293,18 +357,26 @@ describe("POST /api/users/email/verify", () => {
       expect(res.body.attemptsLeft).toBe(5 - attempt);
     }
 
-    // The code itself is burnt: even the RIGHT one is refused now.
-    expect(await EmailVerificationModel.countDocuments()).toBe(0);
+    // The code itself is burnt — even the RIGHT one reads as expired now —
+    // but the signup survives, so a resend hands out a working code again.
+    expect(await PendingSignupModel.countDocuments()).toBe(1);
     const withRealCode = await request(app).post("/api/users/email/verify").send({ email: EMAIL, code });
-    expect(withRealCode.status).toBe(400);
-    expect(withRealCode.body.error).toBe("INVALID_CODE");
-    expect((await storedUser())?.emailVerifiedAt ?? null).toBeNull();
+    expect(withRealCode.status).toBe(410);
+    expect(withRealCode.body.error).toBe("CODE_EXPIRED");
+    expect(await storedUser()).toBeNull();
+
+    const resent = await request(app).post("/api/users/email/resend").send({ email: EMAIL });
+    expect(resent.status).toBe(200);
+    const recovered = await request(app)
+      .post("/api/users/email/verify")
+      .send({ email: EMAIL, code: lastCode() });
+    expect(recovered.status).toBe(200);
   });
 
-  it("refuses an expired code with 410 CODE_EXPIRED and drops it", async () => {
+  it("refuses an expired code with 410 CODE_EXPIRED, and /resend revives the signup", async () => {
     await register();
     const code = lastCode();
-    await EmailVerificationModel.updateOne(
+    await PendingSignupModel.updateOne(
       { emailLower: EMAIL },
       { $set: { expiresAt: new Date(Date.now() - 1000) } }
     );
@@ -312,8 +384,18 @@ describe("POST /api/users/email/verify", () => {
     const res = await request(app).post("/api/users/email/verify").send({ email: EMAIL, code });
     expect(res.status).toBe(410);
     expect(res.body.error).toBe("CODE_EXPIRED");
-    expect(await EmailVerificationModel.countDocuments()).toBe(0);
-    expect((await storedUser())?.emailVerifiedAt ?? null).toBeNull();
+    // Only the CODE died: the row survives on its own clock, so the resend
+    // button on the code screen still means something.
+    expect(await PendingSignupModel.countDocuments()).toBe(1);
+    expect(await storedUser()).toBeNull();
+
+    const resent = await request(app).post("/api/users/email/resend").send({ email: EMAIL });
+    expect(resent.status).toBe(200);
+    const fresh = await request(app)
+      .post("/api/users/email/verify")
+      .send({ email: EMAIL, code: lastCode() });
+    expect(fresh.status).toBe(200);
+    expect(typeof fresh.body.token).toBe("string");
   });
 
   it("refuses a malformed code with 400 INVALID_INPUT", async () => {
@@ -349,7 +431,7 @@ describe("POST /api/users/email/resend", () => {
 });
 
 describe("POST /api/users/email/login", () => {
-  it("refuses an unverified account with 403 EMAIL_NOT_VERIFIED and re-sends a code", async () => {
+  it("refuses a signup that never proved its mailbox with 403 EMAIL_NOT_VERIFIED and re-sends a code", async () => {
     await register();
     sentEmails.length = 0;
 
@@ -362,7 +444,7 @@ describe("POST /api/users/email/login", () => {
     expect(sentEmails).toHaveLength(0);
 
     // Once the cooldown has passed, signing in mails a usable code again.
-    await EmailVerificationModel.updateOne(
+    await PendingSignupModel.updateOne(
       { emailLower: EMAIL },
       { $set: { sentAt: new Date(Date.now() - 2 * 60 * 1000) } }
     );
@@ -401,11 +483,114 @@ describe("POST /api/users/email/login", () => {
   });
 });
 
+describe("pending signups vs the routes around them", () => {
+  it("answers the same 401 for a pending address with the wrong password as for an unknown one", async () => {
+    await register();
+    const onPending = await request(app)
+      .post("/api/users/email/login")
+      .send({ email: EMAIL, password: "wrong-password-entirely" });
+    const onUnknown = await request(app)
+      .post("/api/users/email/login")
+      .send({ email: "nobody@example.com", password: "wrong-password-entirely" });
+    expect(onPending.status).toBe(401);
+    expect(onPending.body).toEqual(onUnknown.body);
+    // And no code was mailed to either: only the password holder gets routed
+    // to the code screen.
+    expect(sentEmails).toHaveLength(1);
+  });
+
+  it("refuses the code with 409 EMAIL_TAKEN when the address was claimed meanwhile", async () => {
+    await register();
+    const code = lastCode();
+    // An Apple sign-in claims the address while the code sits in the mailbox.
+    await createUser("appleuser", { email: EMAIL });
+
+    const res = await request(app).post("/api/users/email/verify").send({ email: EMAIL, code });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("EMAIL_TAKEN");
+    // The row is worthless now and gone; the winner owns the address.
+    expect(await PendingSignupModel.countDocuments()).toBe(0);
+    expect(await AroundUserModel.countDocuments({ email: EMAIL })).toBe(1);
+  });
+});
+
+describe("legacy unverified accounts (created by the previous build)", () => {
+  // The previous build created the user document at registration and parked
+  // the code in email_verifications. Those rows still exist in production the
+  // day this deploys, so the whole path must keep working end to end.
+  async function seedLegacyUnverified() {
+    const passwordHash = await bcrypt.hash(PASSWORD, 10);
+    const now = new Date();
+    const user = await AroundUserModel.create({
+      pseudo: "legacyowl",
+      pseudoLower: "legacyowl",
+      email: EMAIL,
+      passwordHash,
+      emailVerifiedAt: null,
+      locale: "en",
+      radarEnabled: false,
+      status: "active",
+      termsAcceptedAt: now,
+      termsVersion: "2026-08",
+      createdAt: now,
+      lastSeenAt: now
+    });
+    const code = "424242";
+    const codeSalt = "abadcafeabadcafeabadcafeabadcafe";
+    const codeHash = createHmac("sha256", `${config.jwtSecret}:${codeSalt}`).update(code).digest("hex");
+    await EmailVerificationModel.create({
+      userId: user._id,
+      emailLower: EMAIL,
+      codeHash,
+      codeSalt,
+      attempts: 0,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      sentAt: new Date(Date.now() - 2 * 60 * 1000),
+      createdAt: new Date()
+    });
+    return { user, code };
+  }
+
+  it("verifies a legacy unverified user and returns a working token", async () => {
+    const { code } = await seedLegacyUnverified();
+    const res = await request(app).post("/api/users/email/verify").send({ email: EMAIL, code });
+    expect(res.status).toBe(200);
+    expect(res.body.user.pseudo).toBe("legacyowl");
+    expect((await storedUser())?.emailVerifiedAt).toBeTruthy();
+    const me = await request(app).get("/api/users/me").set("Authorization", `Bearer ${res.body.token}`);
+    expect(me.status).toBe(200);
+  });
+
+  it("routes a legacy unverified login to the code screen with a fresh code", async () => {
+    await seedLegacyUnverified();
+    const res = await request(app).post("/api/users/email/login").send({ email: EMAIL, password: PASSWORD });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("EMAIL_NOT_VERIFIED");
+    // The seeded sentAt is past the cooldown, so a usable code was mailed.
+    expect(sentEmails).toHaveLength(1);
+    const verified = await request(app)
+      .post("/api/users/email/verify")
+      .send({ email: EMAIL, code: lastCode() });
+    expect(verified.status).toBe(200);
+  });
+
+  it("re-issues a code for a legacy unverified user through /resend", async () => {
+    await seedLegacyUnverified();
+    const res = await request(app).post("/api/users/email/resend").send({ email: EMAIL });
+    expect(res.status).toBe(200);
+    expect(sentEmails).toHaveLength(1);
+    const verified = await request(app)
+      .post("/api/users/email/verify")
+      .send({ email: EMAIL, code: lastCode() });
+    expect(verified.status).toBe(200);
+  });
+});
+
 describe("secret leakage", () => {
   it("never returns passwordHash, the code or its digest in any response", async () => {
     const registerRes = await register();
     const code = lastCode();
-    const pending = await EmailVerificationModel.findOne({ emailLower: EMAIL }).lean();
+    const pending = await pendingSignup();
     const codeHash = String(pending?.codeHash);
 
     const verifyRes = await request(app).post("/api/users/email/verify").send({ email: EMAIL, code });

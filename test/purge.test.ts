@@ -248,22 +248,22 @@ describe("account deletion cascade (App Store 5.1.1(v))", () => {
     expect(journal?.targetId ?? null).toBeNull();
   });
 
-  // The pseudo is the only visible identity: releasing it the instant an
-  // account is deleted let anyone re-register it and impersonate its owner.
-  it("tombstones the pseudo of a deleted account so it cannot be re-registered", async () => {
+  // Public names stopped being exclusive on 2026-08-30, so the tombstone no
+  // longer guards anything — deletion still writes it (inert, TTL-swept), and
+  // the freed name is immediately usable by anyone, like any other name.
+  it("still writes the tombstone, but the freed name is usable by anyone", async () => {
     const alice = await createUser("ghost");
 
     const res = await request(app).delete("/api/users/me").set("Authorization", alice.auth);
     expect(res.status).toBe(200);
     expect(await AroundReservedPseudoModel.countDocuments({ pseudoLower: "ghost" })).toBe(1);
 
-    // A live account cannot rename itself into the freed pseudo either.
     const mallory = await createUser("mallory");
     const rename = await request(app)
       .patch("/api/users/me")
       .set("Authorization", mallory.auth)
       .send({ pseudo: "ghost" });
-    expect(rename.status).toBe(409);
-    expect(rename.body.error).toBe("PSEUDO_TAKEN");
+    expect(rename.status).toBe(200);
+    expect(rename.body.user.pseudo).toBe("ghost");
   });
 });
