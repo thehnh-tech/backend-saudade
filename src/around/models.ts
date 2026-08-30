@@ -86,7 +86,12 @@ const userSchema = new Schema<AroundUser>({
 
 userSchema.index({ appleSub: 1 }, { unique: true, sparse: true });
 userSchema.index({ googleSub: 1 }, { unique: true, sparse: true });
-userSchema.index({ pseudoLower: 1 }, { unique: true });
+// NOT unique: the public name is a display name, not an identity — several
+// people can carry the same one (product decision, 2026-08-30). Members are
+// told apart by userId everywhere that matters (kick, block, report, approve).
+// The index itself stays for the lookups. syncIndexes() at boot drops the old
+// unique version on the first deploy that ships this line.
+userSchema.index({ pseudoLower: 1 });
 // The e-mail became an identity the day POST /api/users/email/login existed, so
 // it must be unique. `sparse: true` alone would NOT do: a sparse index still
 // indexes an explicit `null`, and every account created through Sign in with
@@ -104,12 +109,10 @@ userSchema.index(
 );
 
 // --- reserved pseudos (post-deletion tombstone) ----------------------------
-// The pseudo is the ONLY identity in this product: the owner of an around
-// approves photos on that basis alone. Deleting the user document released the
-// unique index immediately, so anyone could re-register the pseudo of someone
-// who just left and be taken for them. A tombstone row with a MongoDB TTL is
-// the cheapest fix that survives a restart: no change to the user document, no
-// migration, and the reservation expires on its own after the cooling period.
+// INERT since public names stopped being unique (2026-08-30): with duplicates
+// allowed there is no exclusive claim to protect, so nothing reads this
+// collection any more. Deletion still writes the tombstone (harmless, and the
+// TTL empties the collection on its own) so the model and its history stay.
 
 export const PSEUDO_RESERVATION_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -166,6 +169,55 @@ emailVerificationSchema.index({ emailLower: 1 });
 // braces: every read path re-checks the expiry itself, because MongoDB only
 // sweeps once a minute (and mongodb-memory-server may not sweep at all).
 emailVerificationSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+// --- pending signups -------------------------------------------------------
+// An e-mail signup does NOT create a user any more: everything the account
+// will need — including the bcrypt hash and the code digest — waits here
+// until the mailbox is proven, then POST /verify turns it into a real user
+// and deletes this row. Two clocks, on purpose: `expiresAt` is the CODE's
+// 15 minutes (checked by every read, never a TTL), `purgeAt` is the ROW's
+// day (the TTL) — so an expired or burnt code still leaves a row that
+// /resend can put a fresh code on, and an abandoned signup still vanishes.
+
+export type PendingSignup = {
+  _id: Types.ObjectId;
+  emailLower: string;
+  pseudo: string;
+  pseudoLower: string;
+  passwordHash: string;
+  locale: AroundLocale;
+  termsVersion?: string | null;
+  termsAcceptedAt: Date;
+  codeHash: string;
+  codeSalt: string;
+  attempts: number;
+  expiresAt: Date;
+  sentAt: Date;
+  purgeAt: Date;
+  createdAt: Date;
+};
+
+const pendingSignupSchema = new Schema<PendingSignup>({
+  emailLower: { type: String, required: true },
+  pseudo: { type: String, required: true },
+  pseudoLower: { type: String, required: true },
+  passwordHash: { type: String, required: true },
+  locale: { type: String, required: true, enum: LOCALES },
+  termsVersion: { type: String, default: null },
+  termsAcceptedAt: { type: Date, required: true },
+  codeHash: { type: String, required: true },
+  codeSalt: { type: String, required: true },
+  attempts: { type: Number, required: true, default: 0 },
+  expiresAt: { type: Date, required: true },
+  sentAt: { type: Date, required: true, default: () => new Date() },
+  purgeAt: { type: Date, required: true },
+  createdAt: { type: Date, required: true, default: () => new Date() }
+});
+
+export const PENDING_SIGNUP_PURGE_MS = 24 * 60 * 60 * 1000;
+
+pendingSignupSchema.index({ emailLower: 1 }, { unique: true });
+pendingSignupSchema.index({ purgeAt: 1 }, { expireAfterSeconds: 0 });
 
 // --- devices ---------------------------------------------------------------
 
@@ -500,6 +552,7 @@ const moderationActionSchema = new Schema<ModerationAction>({
 export const AroundUserModel = mongoose.model<AroundUser>("AroundUser", userSchema, "users");
 export const AroundReservedPseudoModel = mongoose.model<ReservedPseudo>("AroundReservedPseudo", reservedPseudoSchema, "reserved_pseudos");
 export const EmailVerificationModel = mongoose.model<EmailVerification>("AroundEmailVerification", emailVerificationSchema, "email_verifications");
+export const PendingSignupModel = mongoose.model<PendingSignup>("AroundPendingSignup", pendingSignupSchema, "pending_signups");
 export const AroundDeviceModel = mongoose.model<AroundDevice>("AroundDevice", deviceSchema, "devices");
 export const DevicePresenceModel = mongoose.model<DevicePresence>("AroundDevicePresence", presenceSchema, "device_presences");
 export const AroundModel = mongoose.model<Around>("Around", aroundSchema, "arounds");
@@ -515,6 +568,7 @@ export async function syncAroundIndexes() {
     AroundUserModel.syncIndexes(),
     AroundReservedPseudoModel.syncIndexes(),
     EmailVerificationModel.syncIndexes(),
+    PendingSignupModel.syncIndexes(),
     AroundDeviceModel.syncIndexes(),
     DevicePresenceModel.syncIndexes(),
     AroundModel.syncIndexes(),

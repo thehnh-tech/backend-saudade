@@ -88,14 +88,17 @@ describe("POST /api/users/oauth", () => {
     expect(me.body.user.pseudo).toBe("NightOwl");
   });
 
-  it("rejects a taken pseudo with PSEUDO_TAKEN", async () => {
+  it("lets a new account carry a public name that already exists", async () => {
+    // Names are display-only since 2026-08-30: identity is the userId, so two
+    // people can both be NightOwl.
     await createUser("nightowl");
     mockIdentity({ sub: "apple-other-sub" });
     const res = await request(app)
       .post("/api/users/oauth")
       .send({ provider: "apple", identityToken: "apple-token", pseudo: "NightOwl" });
-    expect(res.status).toBe(409);
-    expect(res.body.error).toBe("PSEUDO_TAKEN");
+    expect(res.status).toBe(201);
+    expect(res.body.user.pseudo).toBe("NightOwl");
+    expect(await AroundUserModel.countDocuments({ pseudoLower: "nightowl" })).toBe(2);
   });
 
   it("logs an existing user back in by (provider, sub)", async () => {

@@ -13,7 +13,7 @@ import {
   emailResendRateLimit,
   emailVerifyRateLimit
 } from "./aroundRateLimit.js";
-import { authTokenFor, duplicateKeyFields, pseudoIsTaken, pseudoRefusal } from "./identity.js";
+import { authTokenFor, duplicateKeyFields, isDuplicateKeyError, pseudoRefusal } from "./identity.js";
 import { invalidateUserCache, wrap, type AroundRequest } from "./middleware.js";
 import {
   AroundUserModel,
@@ -21,9 +21,12 @@ import {
   EMAIL_CODE_TTL_MS,
   EmailVerificationModel,
   LOCALES,
+  PENDING_SIGNUP_PURGE_MS,
+  PendingSignupModel,
   type AroundLocale,
   type AroundUser,
-  type EmailVerification
+  type EmailVerification,
+  type PendingSignup
 } from "./models.js";
 import { userResponse } from "./serializers.js";
 
@@ -47,7 +50,7 @@ import { userResponse } from "./serializers.js";
 //     routes refuse (503) instead of creating accounts nobody can ever verify.
 // ---------------------------------------------------------------------------
 
-const PASSWORD_MIN = 10;
+const PASSWORD_MIN = 8;
 const PASSWORD_MAX = 200;
 const BCRYPT_COST = 12;
 const EMAIL_MAX = 254; // RFC 5321 path limit.
@@ -248,7 +251,7 @@ const emailField = z.string().trim().min(3).max(EMAIL_MAX).email();
 const registerSchema = z.object({
   email: emailField,
   // Length only: a composition rule ("one uppercase, one digit") narrows the
-  // search space more than it widens it. 10 chars minimum, 200 maximum because
+  // search space more than it widens it. 8 chars minimum, 200 maximum because
   // bcrypt itself truncates at 72 bytes and an unbounded body is a free CPU
   // burn at cost 12.
   password: z.string().min(PASSWORD_MIN).max(PASSWORD_MAX),
@@ -332,37 +335,77 @@ export const registerEmailHandler = wrap(async (req: AroundRequest, res: Respons
     return res.status(201).json(acceptedResponse(email));
   }
 
-  if (await pseudoIsTaken(pseudoLower)) return res.status(409).json({ error: "PSEUDO_TAKEN" });
-
+  // NOTHING is created in `users` here. The whole signup — hash included —
+  // waits in pending_signups until the mailbox is proven; /verify is the only
+  // place an e-mail account is born.
+  //
+  // While a pending row holds a LIVE code, its payload is untouchable: the
+  // code sitting in the mailbox must always create exactly the signup that
+  // requested it, or whoever re-registers the address second could swap their
+  // own passwordHash under the first person's code and inherit the account
+  // the moment that person verifies. So a re-register only refreshes the code
+  // for the ORIGINAL payload (cooldown permitting) — the same first-writer
+  // semantics the unique email index used to enforce. Once the code is dead,
+  // the claim is dead with it and the row is rewritten whole.
+  const existingPending = await PendingSignupModel.findOne({ emailLower: email }).lean<PendingSignup>();
   const now = new Date();
-  let created: AroundUser;
+
+  if (existingPending && existingPending.expiresAt.getTime() > now.getTime()) {
+    if (now.getTime() - existingPending.sentAt.getTime() >= RESEND_COOLDOWN_MS) {
+      const code = generateCode();
+      const codeSalt = randomBytes(16).toString("hex");
+      await PendingSignupModel.updateOne(
+        { _id: existingPending._id },
+        {
+          $set: {
+            codeHash: hashCode(code, codeSalt),
+            codeSalt,
+            attempts: 0,
+            expiresAt: new Date(now.getTime() + EMAIL_CODE_TTL_MS),
+            sentAt: now
+          }
+        }
+      );
+      const body = CODE_MAIL[localeOf(existingPending.locale)](code);
+      await sendQuietly(sendMail(email, body.subject, body.text), "verification code");
+    }
+    return res.status(201).json(acceptedResponse(email));
+  }
+
+  const code = generateCode();
+  const codeSalt = randomBytes(16).toString("hex");
   try {
-    const document = await AroundUserModel.create({
-      pseudo,
-      pseudoLower,
-      email,
-      passwordHash,
-      emailVerifiedAt: null,
-      locale: parsed.data.locale,
-      radarEnabled: false,
-      status: "active",
-      termsAcceptedAt: now,
-      termsVersion: parsed.data.termsVersion ?? "2026-08",
-      createdAt: now,
-      lastSeenAt: now
-    });
-    created = document.toObject() as AroundUser;
+    await PendingSignupModel.updateOne(
+      { emailLower: email },
+      {
+        $set: {
+          pseudo,
+          pseudoLower,
+          passwordHash,
+          locale: parsed.data.locale,
+          termsVersion: parsed.data.termsVersion ?? "2026-08",
+          termsAcceptedAt: now,
+          codeHash: hashCode(code, codeSalt),
+          codeSalt,
+          attempts: 0,
+          expiresAt: new Date(now.getTime() + EMAIL_CODE_TTL_MS),
+          sentAt: now,
+          purgeAt: new Date(now.getTime() + PENDING_SIGNUP_PURGE_MS)
+        },
+        $setOnInsert: { emailLower: email, createdAt: now }
+      },
+      { upsert: true }
+    );
   } catch (error) {
-    const fields = duplicateKeyFields(error);
-    // Lost the race on the address: same generic answer as the branch above,
-    // and no mail (the winner of the race already got one).
-    if (fields.includes("email")) return res.status(201).json(acceptedResponse(email));
-    if (fields.includes("pseudoLower")) return res.status(409).json({ error: "PSEUDO_TAKEN" });
+    // Two twins racing the insert arm of the upsert: the loser's E11000 means
+    // the winner's row (and mail) exist, so the uniform answer stands.
+    if (isDuplicateKeyError(error)) return res.status(201).json(acceptedResponse(email));
     throw error;
   }
 
-  await sendQuietly(issueVerificationCode(created), "verification code");
-  // No token: the account is unusable until the mailbox is proven.
+  const body = CODE_MAIL[localeOf(parsed.data.locale)](code);
+  await sendQuietly(sendMail(email, body.subject, body.text), "verification code");
+  // No token: nothing exists yet that a token could name.
   return res.status(201).json(acceptedResponse(email));
 });
 
@@ -371,6 +414,74 @@ export const verifyEmailHandler = wrap(async (req: AroundRequest, res: Response)
   if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
 
   const email = normalizeEmail(parsed.data.email);
+
+  // Pending signup first: since 2026-08-30 this is where every new e-mail
+  // account waits, and PROVING THE CODE IS WHAT CREATES THE USER. The
+  // EmailVerification path below survives for accounts created unverified by
+  // the previous build.
+  const pending = await PendingSignupModel.findOneAndUpdate(
+    { emailLower: email },
+    { $inc: { attempts: 1 } },
+    { returnDocument: "after" }
+  ).lean<PendingSignup>();
+  if (pending) {
+    // Expiry and the 5th wrong try kill the CODE, never the row: /resend must
+    // still find something to put a fresh code on, or its anti-enumeration
+    // 200 would quietly promise a mail that can never come. The row itself
+    // dies on its own clock (purgeAt).
+    if (pending.expiresAt.getTime() <= Date.now()) {
+      return res.status(410).json({ error: "CODE_EXPIRED" });
+    }
+    const pendingAttemptsLeft = Math.max(0, EMAIL_CODE_MAX_ATTEMPTS - pending.attempts);
+    if (!codeMatches(parsed.data.code, pending)) {
+      if (pendingAttemptsLeft === 0) {
+        await PendingSignupModel.updateOne(
+          { _id: pending._id },
+          { $set: { expiresAt: new Date(0) } }
+        );
+      }
+      return res.status(400).json({ error: "INVALID_CODE", attemptsLeft: pendingAttemptsLeft });
+    }
+
+    // Create FIRST, discard the row after: a transient write failure here
+    // must leave the signup intact for a retry, not destroy it.
+    const bornAt = new Date();
+    let created: AroundUser;
+    try {
+      const document = await AroundUserModel.create({
+        pseudo: pending.pseudo,
+        pseudoLower: pending.pseudoLower,
+        email,
+        passwordHash: pending.passwordHash,
+        emailVerifiedAt: bornAt,
+        locale: pending.locale,
+        radarEnabled: false,
+        status: "active",
+        termsAcceptedAt: pending.termsAcceptedAt,
+        termsVersion: pending.termsVersion ?? "2026-08",
+        createdAt: bornAt,
+        lastSeenAt: bornAt
+      });
+      created = document.toObject() as AroundUser;
+    } catch (error) {
+      const fields = duplicateKeyFields(error);
+      // The address was claimed while the code sat in the mailbox (an Apple
+      // sign-in, or another device finishing first). Nothing left to verify —
+      // the winner owns the address, and the row is worthless now.
+      if (fields.includes("email")) {
+        await PendingSignupModel.deleteOne({ _id: pending._id });
+        return res.status(409).json({ error: "EMAIL_TAKEN" });
+      }
+      // Stale unique pseudoLower index (pre-migration): the row survives so
+      // the same code works again once syncIndexes has done its job.
+      if (fields.includes("pseudoLower")) {
+        return res.status(409).json({ error: "PSEUDO_TAKEN" });
+      }
+      throw error;
+    }
+    await PendingSignupModel.deleteOne({ _id: pending._id });
+    return res.json({ token: authTokenFor(created), user: userResponse(created) });
+  }
 
   // The attempt is counted BEFORE the code is looked at, so a client that
   // disconnects mid-request still burns its try.
@@ -421,6 +532,32 @@ export const resendEmailHandler = wrap(async (req: AroundRequest, res: Response)
   const email = normalizeEmail(parsed.data.email);
   const user = await AroundUserModel.findOne({ email }).select("+passwordHash").lean<AroundUser>();
 
+  if (!user) {
+    // A signup still waiting on its mailbox gets a fresh code and a fresh
+    // budget; the row's TTL moves with it. Same silent 200 either way.
+    const pending = await PendingSignupModel.findOne({ emailLower: email }).lean<PendingSignup>();
+    if (pending) {
+      const code = generateCode();
+      const codeSalt = randomBytes(16).toString("hex");
+      const now = new Date();
+      await PendingSignupModel.updateOne(
+        { _id: pending._id },
+        {
+          $set: {
+            codeHash: hashCode(code, codeSalt),
+            codeSalt,
+            attempts: 0,
+            expiresAt: new Date(now.getTime() + EMAIL_CODE_TTL_MS),
+            sentAt: now
+          }
+        }
+      );
+      const body = CODE_MAIL[localeOf(pending.locale)](code);
+      await sendQuietly(sendMail(email, body.subject, body.text), "verification code");
+    }
+    return res.json(acceptedResponse(email));
+  }
+
   if (user && user.passwordHash && !user.emailVerifiedAt && user.status !== "banned") {
     await sendQuietly(issueVerificationCode(user), "verification code");
   } else if (user) {
@@ -441,11 +578,49 @@ export const loginEmailHandler = wrap(async (req: AroundRequest, res: Response) 
   const email = normalizeEmail(parsed.data.email);
   const user = await AroundUserModel.findOne({ email }).select("+passwordHash").lean<AroundUser>();
 
+  // A signup that never proved its mailbox has no user row yet — it lives in
+  // pending_signups. Whoever holds ITS password gets routed to the code
+  // screen, exactly like an unverified legacy account; anyone else falls
+  // through to the same 401 as always.
+  const pending = user
+    ? null
+    : await PendingSignupModel.findOne({ emailLower: email }).lean<PendingSignup>();
+
   // Unknown address, or an address that belongs to an Apple-only account: the
   // comparison still runs (against a decoy digest) and the answer is the exact
   // same 401 as a wrong password.
-  const stored = user?.passwordHash || DUMMY_PASSWORD_HASH;
+  const stored = user?.passwordHash || pending?.passwordHash || DUMMY_PASSWORD_HASH;
   const passwordOk = await bcrypt.compare(parsed.data.password, stored);
+
+  if (!user && pending && passwordOk) {
+    // Fresh code only if the last one is older than the cooldown, mirroring
+    // the legacy unverified branch below.
+    if (Date.now() - pending.sentAt.getTime() >= RESEND_COOLDOWN_MS) {
+      const code = generateCode();
+      const codeSalt = randomBytes(16).toString("hex");
+      const now = new Date();
+      await PendingSignupModel.updateOne(
+        { _id: pending._id },
+        {
+          $set: {
+            codeHash: hashCode(code, codeSalt),
+            codeSalt,
+            attempts: 0,
+            expiresAt: new Date(now.getTime() + EMAIL_CODE_TTL_MS),
+            sentAt: now
+          }
+        }
+      );
+      const body = CODE_MAIL[localeOf(pending.locale)](code);
+      await sendQuietly(sendMail(email, body.subject, body.text), "verification code");
+    }
+    return res.status(403).json({
+      error: "EMAIL_NOT_VERIFIED",
+      email,
+      expiresInSeconds: EMAIL_CODE_TTL_MS / 1000
+    });
+  }
+
   if (!user || !user.passwordHash || !passwordOk) {
     return res.status(401).json({ error: "INVALID_CREDENTIALS" });
   }

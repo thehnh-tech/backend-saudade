@@ -5,7 +5,7 @@ import { config } from "../config.js";
 import type { AuthedRequest } from "../types.js";
 import { deviceRateLimit, locationRateLimit, oauthRateLimit, reportRateLimit } from "./aroundRateLimit.js";
 import { purgeEmailVerifications, registerEmailAuthRoutes } from "./emailAuth.js";
-import { authTokenFor, isDuplicateKeyError, pseudoIsTaken, pseudoRefusal } from "./identity.js";
+import { authTokenFor, isDuplicateKeyError, pseudoRefusal } from "./identity.js";
 import { geoPoint } from "./models.js";
 import {
   AroundBlockModel,
@@ -143,7 +143,6 @@ export function registerAroundUserRoutes(app: Express) {
     if (refusal) return res.status(400).json(refusal);
 
     const pseudoLower = pseudo.toLowerCase();
-    if (await pseudoIsTaken(pseudoLower)) return res.status(409).json({ error: "PSEUDO_TAKEN" });
 
     const refreshToken = await appleRefreshTokenFrom(parsed.data.provider, parsed.data.authorizationCode);
 
@@ -165,6 +164,8 @@ export function registerAroundUserRoutes(app: Express) {
       const createdUser = created.toObject() as AroundUser;
       return res.status(201).json({ token: authTokenFor(createdUser), user: userResponse(createdUser), created: true });
     } catch (error) {
+      // Stale unique pseudoLower index (pre-migration) or a sub/email race:
+      // either way the caller can retry once the dust settles.
       if (isDuplicateKeyError(error)) return res.status(409).json({ error: "PSEUDO_TAKEN" });
       throw error;
     }
@@ -184,7 +185,6 @@ export function registerAroundUserRoutes(app: Express) {
       const refusal = pseudoRefusal(pseudo);
       if (refusal) return res.status(400).json(refusal);
       const pseudoLower = pseudo.toLowerCase();
-      if (await pseudoIsTaken(pseudoLower, user._id)) return res.status(409).json({ error: "PSEUDO_TAKEN" });
       try {
         await AroundUserModel.updateOne({ _id: user._id }, { $set: { pseudo, pseudoLower } });
       } catch (error) {
