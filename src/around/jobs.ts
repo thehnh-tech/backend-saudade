@@ -29,7 +29,7 @@ export async function runAroundMinuteTick(now = new Date()) {
       { $set: { endingNotifiedAt: now } }
     ).lean<Around>();
     if (!claimed) continue;
-    void notifyAroundEnding(around).catch((error) => {
+    await notifyAroundEnding(around).catch((error) => {
       console.error("[around:jobs] around-ending push failed", error);
     });
   }
@@ -48,7 +48,7 @@ export async function runAroundMinuteTick(now = new Date()) {
     const pending = await pendingCountFor(around);
     if (pending > 0) {
       await AroundModel.updateOne({ _id: around._id }, { $set: { closeReminderSentAt: now } });
-      void notifyOwnerPhotoPending(around, pending).catch((error) => {
+      await notifyOwnerPhotoPending(around, pending).catch((error) => {
         console.error("[around:jobs] photo-pending push failed", error);
       });
     }
@@ -65,7 +65,7 @@ export async function runAroundMinuteTick(now = new Date()) {
     await AroundModel.updateOne({ _id: around._id }, { $set: { pendingReminder24hSentAt: now } });
     const pending = await pendingCountFor(around);
     if (pending > 0) {
-      void notifyOwnerPhotoPending(around, pending).catch((error) => {
+      await notifyOwnerPhotoPending(around, pending).catch((error) => {
         console.error("[around:jobs] photo-pending T+24h push failed", error);
       });
     }
@@ -97,7 +97,7 @@ export async function runAroundPurgeTick(now = new Date()) {
 let minuteRunning = false;
 let purgeRunning = false;
 
-async function safeMinuteTick() {
+export async function safeMinuteTick() {
   if (minuteRunning) return;
   minuteRunning = true;
   try {
@@ -109,7 +109,7 @@ async function safeMinuteTick() {
   }
 }
 
-async function safePurgeTick() {
+export async function safePurgeTick() {
   if (purgeRunning) return;
   purgeRunning = true;
   try {

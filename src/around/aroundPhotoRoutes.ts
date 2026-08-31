@@ -25,6 +25,7 @@ import {
 import { downloadUrl } from "./photoDelivery.js";
 import { destroyPhotoAssets } from "./purge.js";
 import { notifyPhotoApproved } from "./push.js";
+import { runDetached } from "./serverless.js";
 import { aroundPhotoResponse } from "./serializers.js";
 
 // Multer config copied from the frozen routes.ts (NOT exported from it).
@@ -262,9 +263,9 @@ export function registerAroundPhotoRoutes(app: Express) {
     if (result.matchedCount === 0) return res.status(409).json({ error: "INVALID_STATUS_TRANSITION" });
     const updated = { ...photo, status: "approved" as const, approvedAt: now };
 
-    void notifyPhotoApproved(around, photo.uploaderId).catch((error) => {
+    runDetached(notifyPhotoApproved(around, photo.uploaderId).catch((error) => {
       console.error("[around:push] photo-approved failed", error);
-    });
+    }));
 
     const uploader = await AroundUserModel.findById(photo.uploaderId).lean<AroundUser>();
     noStore(res);
