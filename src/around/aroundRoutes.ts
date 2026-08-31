@@ -17,6 +17,7 @@ import {
   type AroundUser
 } from "./models.js";
 import { fanOutAroundCreated } from "./push.js";
+import { runDetached } from "./serverless.js";
 import { aroundResponse, memberResponse } from "./serializers.js";
 import { checkUserText } from "./textFilter.js";
 
@@ -191,9 +192,11 @@ export function registerAroundRoutes(app: Express) {
       createdAt: now
     });
 
-    void fanOutAroundCreated(around).catch((error) => {
-      console.error("[around:push] fan-out failed", error);
-    });
+    runDetached(
+      fanOutAroundCreated(around).catch((error) => {
+        console.error("[around:push] fan-out failed", error);
+      })
+    );
 
     return res.status(201).json({ around: aroundResponse(around, { viewerId: String(user._id), ownerPseudo: user.pseudo, role: "owner" }) });
   }));

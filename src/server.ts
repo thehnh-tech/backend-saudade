@@ -16,6 +16,7 @@ import { registerAdminAroundRoutes } from "./around/adminAroundRoutes.js";
 import { registerAroundPhotoRoutes } from "./around/aroundPhotoRoutes.js";
 import { registerAroundRoutes } from "./around/aroundRoutes.js";
 import { startAroundJobs } from "./around/jobs.js";
+import { aroundOpportunisticJobs, cronSweepHandler } from "./around/serverless.js";
 import { syncAroundIndexes } from "./around/models.js";
 import { registerAroundUserRoutes } from "./around/userRoutes.js";
 
@@ -36,6 +37,12 @@ registerCheckoutRoutes(app);
 registerRoutes(app);
 
 // Picture me around (additive module)
+// On Vercel the requests tow the jobs (see serverless.ts); the cron sweep is
+// the once-a-day net under them, inert without its secret.
+if (process.env.VERCEL) app.use(aroundOpportunisticJobs);
+app.get("/api/internal/cron/sweep", (req, res) => {
+  void cronSweepHandler(req, res).catch(() => res.status(500).json({ error: "INTERNAL_ERROR" }));
+});
 registerAroundUserRoutes(app);
 registerAroundRoutes(app);
 registerAroundPhotoRoutes(app);
@@ -51,7 +58,7 @@ try {
   // keep booting (the module runs degraded until the index issue is fixed).
   console.error("[around] index sync failed — around module degraded, frozen API unaffected:", err);
 }
-startAroundJobs();
+if (!process.env.VERCEL) startAroundJobs();
 
 app.listen(config.port, config.host, () => {
   console.log(`Saudade API listening on ${config.host}:${config.port} (public: ${config.apiPublicUrl})`);
