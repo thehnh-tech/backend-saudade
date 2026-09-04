@@ -17,8 +17,9 @@ vi.mock("expo-server-sdk", async () => (await import("./helpers/mocks.js")).expo
 
 import { resetAroundRateLimits } from "../src/around/aroundRateLimit.js";
 import { resetUserCache } from "../src/around/middleware.js";
-import { AroundUserModel } from "../src/around/models.js";
-import { makeTestApp } from "./helpers/app.js";
+import { AroundUserModel, DevicePresenceModel } from "../src/around/models.js";
+import { config } from "../src/config.js";
+import { makeLegacyTestApp, makeTestApp } from "./helpers/app.js";
 import { clearCollections, setupTestDb, teardownTestDb } from "./helpers/db.js";
 import { LAUSANNE, createUser } from "./helpers/fixtures.js";
 
@@ -33,6 +34,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  vi.useRealTimers();
   await clearCollections();
   resetAroundRateLimits();
   resetUserCache();
@@ -140,6 +142,73 @@ describe("rate limiting (429 RATE_LIMITED + Retry-After)", () => {
     expect(bobRes.status).toBe(200);
   });
 
+  it("stores a bounded client capturedAt (and its source), falls back to receipt time outside the bounds", async () => {
+    const alice = await createUser("alice");
+    await AroundUserModel.updateOne({ _id: alice.user._id }, { $set: { radarEnabled: true } });
+
+    // In bounds: a background batch iOS delivered 5 min late keeps its own
+    // timestamp instead of being stamped fresher than it is.
+    const claimed = new Date(Date.now() - 5 * 60_000);
+    const inBounds = await request(app)
+      .post("/api/users/me/location")
+      .set("Authorization", alice.auth)
+      .send({
+        lat: LAUSANNE.lat,
+        lng: LAUSANNE.lng,
+        accuracy: 15,
+        capturedAt: claimed.toISOString(),
+        source: "background"
+      });
+    expect(inBounds.status).toBe(200);
+    let presence = await DevicePresenceModel.findOne({ userId: alice.user._id }).lean();
+    expect(presence?.capturedAt.getTime()).toBe(claimed.getTime());
+    expect(presence?.source).toBe("background");
+    // updatedAt (the TTL clock) is always server-stamped.
+    expect(presence?.updatedAt.getTime()).toBeGreaterThan(claimed.getTime());
+
+    // Out of bounds (a clock an hour ahead): fall back to receipt time,
+    // never a rejection — a skewed clock must not make a phone invisible.
+    resetAroundRateLimits();
+    const before = Date.now();
+    const future = await request(app)
+      .post("/api/users/me/location")
+      .set("Authorization", alice.auth)
+      .send({
+        lat: LAUSANNE.lat,
+        lng: LAUSANNE.lng,
+        accuracy: 15,
+        capturedAt: new Date(Date.now() + 60 * 60_000).toISOString()
+      });
+    expect(future.status).toBe(200);
+    presence = await DevicePresenceModel.findOne({ userId: alice.user._id }).lean();
+    expect(presence!.capturedAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(presence!.capturedAt.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("degrades an unparseable capturedAt to receipt time instead of rejecting the post", async () => {
+    const alice = await createUser("alice");
+    await AroundUserModel.updateOne({ _id: alice.user._id }, { $set: { radarEnabled: true } });
+    const before = Date.now();
+    const res = await request(app)
+      .post("/api/users/me/location")
+      .set("Authorization", alice.auth)
+      .send({ lat: LAUSANNE.lat, lng: LAUSANNE.lng, accuracy: 15, capturedAt: "not-a-date" });
+    expect(res.status).toBe(200);
+    const presence = await DevicePresenceModel.findOne({ userId: alice.user._id }).lean();
+    expect(presence!.capturedAt.getTime()).toBeGreaterThanOrEqual(before);
+  });
+
+  it("refuses the retired significant-change source (400)", async () => {
+    const alice = await createUser("alice");
+    await AroundUserModel.updateOne({ _id: alice.user._id }, { $set: { radarEnabled: true } });
+    const res = await request(app)
+      .post("/api/users/me/location")
+      .set("Authorization", alice.auth)
+      .send({ lat: LAUSANNE.lat, lng: LAUSANNE.lng, accuracy: 15, source: "significant-change" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("INVALID_INPUT");
+  });
+
   it("refuses location updates when Radar is off (403 RADAR_DISABLED)", async () => {
     const alice = await createUser("alice");
     const res = await request(app)
@@ -148,5 +217,58 @@ describe("rate limiting (429 RATE_LIMITED + Retry-After)", () => {
       .send({ lat: LAUSANNE.lat, lng: LAUSANNE.lng, accuracy: 15 });
     expect(res.status).toBe(403);
     expect(res.body.error).toBe("RADAR_DISABLED");
+  });
+});
+
+// Two app instances over the same database ARE two warm lambdas: the shared
+// store (sharedRateLimit.ts) must make budgets and lockouts hold across them,
+// where the in-memory limiters used to hand each instance its own.
+describe("shared limiter store — cross-instance", () => {
+  it("shares the admin-login window AND lockout across instances", async () => {
+    const appA = await makeLegacyTestApp();
+    const appB = await makeLegacyTestApp();
+
+    // Pin Date to the window start so the request run cannot straddle a
+    // fixed-window boundary (only Date is faked; timers and Mongo are real).
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Math.floor(Date.now() / (15 * 60 * 1000)) * (15 * 60 * 1000));
+
+    for (let i = 0; i < 5; i += 1) {
+      const res = await request(appA).post("/api/admin/login").send({ login: "admin", password: `wrong-${i}` });
+      expect(res.status).toBe(401);
+    }
+
+    // Sixth attempt on the OTHER instance: the window budget is shared.
+    const sixth = await request(appB).post("/api/admin/login").send({ login: "admin", password: "wrong-5" });
+    expect(sixth.status).toBe(429);
+
+    // The lockout armed by the 5 consecutive 401s holds there too, even with
+    // the right credentials.
+    const withCreds = await request(appB)
+      .post("/api/admin/login")
+      .send({ login: config.adminLogin, password: config.adminPassword });
+    expect(withCreds.status).toBe(429);
+
+    vi.useRealTimers();
+  });
+
+  it("counts concurrent hits atomically across instances (upsert race, no 500s)", async () => {
+    const appA = await makeLegacyTestApp();
+    const appB = await makeLegacyTestApp();
+
+    const attempts = await Promise.all(
+      Array.from({ length: 8 }, (_, i) =>
+        request(i % 2 === 0 ? appA : appB)
+          .post("/api/admin/login")
+          .send({ login: "admin", password: `w-${i}` })
+      )
+    );
+    const statuses = attempts.map((res) => res.status);
+    for (const status of statuses) expect([401, 429]).toContain(status);
+    // Fixed window of 5: the atomic $inc admits exactly five, whichever
+    // instance they landed on — a lost increment or a 500 on the racing
+    // first upsert would break the split.
+    expect(statuses.filter((status) => status === 401)).toHaveLength(5);
+    expect(statuses.filter((status) => status === 429)).toHaveLength(3);
   });
 });

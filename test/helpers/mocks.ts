@@ -37,6 +37,28 @@ export function backendCloudinaryMockFactory() {
   };
 }
 
+// --- Expo push spy --------------------------------------------------------
+// Every message handed to the mocked Expo client lands here, in send order,
+// so a test can assert WHO was rung and with WHAT (this module is evaluated
+// once per test file, so the registry is per file; reset it in beforeEach).
+
+export type SentPush = { to: string; title?: string; body?: string; data?: Record<string, unknown>; _contentAvailable?: boolean; ttl?: number };
+
+export const expoSent: SentPush[] = [];
+
+export function resetExpoSent() {
+  expoSent.length = 0;
+}
+
+// Tokens listed here make the mocked client answer a ticket error instead of
+// "ok" (e.g. DeviceNotRegistered); a token in `expoChunkPoison` makes the
+// WHOLE chunk containing it throw, like Expo does for a token of another
+// project (PUSH_TOO_MANY_EXPERIENCE_IDS).
+export const expoTicketErrors = new Map<string, string>();
+export const expoChunkPoison = new Set<string>();
+
+let ticketSeq = 0;
+
 export function expoMockFactory() {
   class MockExpo {
     chunkPushNotifications(messages: unknown[]) {
@@ -47,8 +69,18 @@ export function expoMockFactory() {
       return [ids];
     }
 
-    async sendPushNotificationsAsync(messages: unknown[]) {
-      return messages.map((_message, index) => ({ status: "ok", id: `ticket-${index}` }));
+    async sendPushNotificationsAsync(messages: SentPush[]) {
+      if (messages.some((message) => expoChunkPoison.has(message.to))) {
+        throw new Error("PUSH_TOO_MANY_EXPERIENCE_IDS");
+      }
+      return messages.map((message) => {
+        expoSent.push(message);
+        ticketSeq += 1;
+        const error = expoTicketErrors.get(message.to);
+        return error
+          ? { status: "error", message: error, details: { error } }
+          : { status: "ok", id: `ticket-${ticketSeq}` };
+      });
     }
 
     async getPushNotificationReceiptsAsync(ids: string[]) {

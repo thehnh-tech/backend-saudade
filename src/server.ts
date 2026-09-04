@@ -17,6 +17,7 @@ import { registerAroundPhotoRoutes } from "./around/aroundPhotoRoutes.js";
 import { registerAroundRoutes } from "./around/aroundRoutes.js";
 import { startAroundJobs } from "./around/jobs.js";
 import { aroundOpportunisticJobs, cronSweepHandler } from "./around/serverless.js";
+import { SESSION_TOKEN_HEADER } from "./around/middleware.js";
 import { syncAroundIndexes } from "./around/models.js";
 import { registerAroundUserRoutes } from "./around/userRoutes.js";
 
@@ -28,7 +29,10 @@ app.use(cors({
   origin(origin, callback) {
     if (!origin || config.corsOrigins.includes(origin)) callback(null, true);
     else callback(new Error("CORS blocked"));
-  }
+  },
+  // The renewed session token rides a response header (around/middleware.ts);
+  // a browser client can only read it when it is exposed.
+  exposedHeaders: [SESSION_TOKEN_HEADER]
 }));
 registerStripeWebhook(app);
 app.use(express.json({ limit: "1mb" }));
@@ -38,11 +42,13 @@ registerRoutes(app);
 
 // Picture me around (additive module)
 // On Vercel the requests tow the jobs (see serverless.ts); the cron sweep is
-// the once-a-day net under them, inert without its secret.
-if (process.env.VERCEL) app.use(aroundOpportunisticJobs);
+// the once-a-day net under them, inert without its secret. The cron route is
+// registered BEFORE the opportunistic middleware (which also skips
+// /api/internal/*) so the handler owns the ticks it awaits.
 app.get("/api/internal/cron/sweep", (req, res) => {
   void cronSweepHandler(req, res).catch(() => res.status(500).json({ error: "INTERNAL_ERROR" }));
 });
+if (process.env.VERCEL) app.use(aroundOpportunisticJobs);
 registerAroundUserRoutes(app);
 registerAroundRoutes(app);
 registerAroundPhotoRoutes(app);

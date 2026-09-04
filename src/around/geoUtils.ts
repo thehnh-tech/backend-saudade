@@ -2,9 +2,15 @@ import type { Request } from "express";
 import geoip from "geoip-lite";
 import { config } from "../config.js";
 import { lookupGeo, type GeoLocation } from "../geo.js";
-import type { Around } from "./models.js";
+import type { Around, GeoPoint } from "./models.js";
 
 const EARTH_RADIUS_M = 6_371_000;
+
+// One gate, two postures: /join refuses past this distance (physical presence
+// is the claim there), /nearby only degrades (geoip is centroid-coarse for
+// CGNAT, VPNs and overseas carriers — a hard refusal blanks the radar for
+// real users).
+export const GEO_IP_MAX_DISTANCE_KM = 1000;
 
 export function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number) {
   const toRad = (deg: number) => (deg * Math.PI) / 180;
@@ -20,6 +26,32 @@ export function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: 
 // 65 m so a coarse fix cannot buy extra range) plus a 20 m grace margin.
 export function joinToleranceM(accuracy: number) {
   return Math.min(Math.max(accuracy, 0), 65) + 20;
+}
+
+export const M_PER_DEG_LAT = 111_320;
+
+/**
+ * Per-around DISPLAY centre offset, 5–15 m, deterministic (FNV-1a over the id
+ * — stable across restarts, opaque to callers). Used wherever a non-member is
+ * handed a figure derived from the centre (/nearby distances, wake regions):
+ * probing converges on this decoy, never on the owner's position.
+ */
+export function displayCenterOffset(id: string): { dLatM: number; dLngM: number } {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < id.length; i += 1) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  const angle = ((h >>> 0) % 360) * (Math.PI / 180);
+  const radius = 5 + ((h >>> 9) % 11);
+  return { dLatM: Math.sin(angle) * radius, dLngM: Math.cos(angle) * radius };
+}
+
+export function offsetPoint(lat: number, lng: number, dLatM: number, dLngM: number): { lat: number; lng: number } {
+  return {
+    lat: lat + dLatM / M_PER_DEG_LAT,
+    lng: lng + dLngM / (M_PER_DEG_LAT * Math.cos((lat * Math.PI) / 180))
+  };
 }
 
 // req.ip is derived by Express according to `trust proxy` (rightmost
@@ -44,11 +76,18 @@ export type JoinRejection = {
   details?: Record<string, unknown>;
 };
 
+// What the membership stores. Derived numbers only — the raw lat/lng, the IP
+// and the geoIP city are consumed by the verification below and go no further
+// ("position jamais conservée" is a promise the database has to keep too).
+export type JoinAuditFix = {
+  accuracy: number;
+  capturedAt: Date;
+  distanceM: number;
+};
+
 export type JoinAudit = {
-  joinFixes: Array<JoinFixInput & { distanceM: number }>;
+  joinFixes: JoinAuditFix[];
   interFixDistanceM: number;
-  joinIp: string | null;
-  joinGeo: GeoLocation | null;
   suspicious: boolean;
 };
 
@@ -71,7 +110,9 @@ export function geoIpConsistency(ip: string | null, lat: number, lng: number): {
 // /kicked which are handled by the route): accuracy -> freshness/spacing ->
 // radius on EACH fix -> inter-fix speed plausibility -> GeoIP consistency.
 export function verifyJoinFixes(
-  around: Pick<Around, "center" | "radiusM">,
+  // Callers only ever pass active arounds, whose centre always exists — the
+  // optional field on Around covers purged/erased docs, refused upstream.
+  around: Pick<Around, "radiusM"> & { center: GeoPoint },
   fixes: [JoinFixInput, JoinFixInput],
   options: { ip: string | null; now?: Date; bypassGeoChecks?: boolean }
 ): JoinVerdict {
@@ -121,7 +162,7 @@ export function verifyJoinFixes(
     haversineMeters(fixes[0].lat, fixes[0].lng, fixes[1].lat, fixes[1].lng)
   );
 
-  const { geo, distanceKm } = geoIpConsistency(options.ip, fixes[1].lat, fixes[1].lng);
+  const { distanceKm } = geoIpConsistency(options.ip, fixes[1].lat, fixes[1].lng);
   let suspicious = false;
 
   if (!bypass) {
@@ -148,7 +189,7 @@ export function verifyJoinFixes(
     }
 
     if (distanceKm !== null) {
-      if (distanceKm > 1000) {
+      if (distanceKm > GEO_IP_MAX_DISTANCE_KM) {
         return {
           ok: false,
           status: 403,
@@ -163,10 +204,12 @@ export function verifyJoinFixes(
   return {
     ok: true,
     audit: {
-      joinFixes: withDistances,
+      joinFixes: withDistances.map((fix) => ({
+        accuracy: fix.accuracy,
+        capturedAt: fix.capturedAt,
+        distanceM: fix.distanceM
+      })),
       interFixDistanceM,
-      joinIp: options.ip,
-      joinGeo: geo,
       suspicious
     }
   };

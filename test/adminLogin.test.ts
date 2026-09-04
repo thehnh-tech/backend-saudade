@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import request from "supertest";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("cloudinary", async () => (await import("./helpers/mocks.js")).cloudinaryPackageMockFactory());
 vi.mock("../src/cloudinary.js", async () => (await import("./helpers/mocks.js")).backendCloudinaryMockFactory());
@@ -9,23 +9,42 @@ vi.mock("expo-server-sdk", async () => (await import("./helpers/mocks.js")).expo
 import { resetAroundRateLimits } from "../src/around/aroundRateLimit.js";
 import { config } from "../src/config.js";
 import { makeLegacyTestApp } from "./helpers/app.js";
+import { clearCollections, setupTestDb, teardownTestDb } from "./helpers/db.js";
 
 // POST /api/admin/login is the single door to the whole moderation surface
 // (clear URLs of every reported photo, ban, purge) and it is guarded by one
 // static shared password. These tests pin the throttle that keeps a bruteforce
-// from being free. No database is involved: the handler only compares strings.
+// from being free. The handler itself only compares strings, but the limiter
+// and lockout live in the shared Mongo store (sharedRateLimit.ts) so warm
+// lambdas cannot each hand out their own budget — hence the database here.
 let app: Express;
 
 beforeAll(async () => {
+  await setupTestDb();
   app = await makeLegacyTestApp();
 });
 
-beforeEach(() => {
+afterAll(async () => {
+  await teardownTestDb();
+});
+
+beforeEach(async () => {
+  vi.useRealTimers();
+  await clearCollections();
   resetAroundRateLimits();
 });
 
+/** Pins Date to the current fixed window's start: a request loop can then
+ * never straddle a boundary and split its count over two windows. Only Date
+ * is faked — timers and Mongo stay real. */
+function pinToWindowStart(windowMs: number) {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(Math.floor(Date.now() / windowMs) * windowMs);
+}
+
 describe("POST /api/admin/login throttling", () => {
   it("caps failed attempts at 5 per 15 min per IP (6th is 429 RATE_LIMITED)", async () => {
+    pinToWindowStart(15 * 60 * 1000);
     for (let i = 0; i < 5; i += 1) {
       const res = await request(app).post("/api/admin/login").send({ login: "admin", password: `wrong-${i}` });
       expect(res.status).toBe(401);
@@ -39,6 +58,7 @@ describe("POST /api/admin/login throttling", () => {
   });
 
   it("keeps throttling a locked-out IP even with correct credentials", async () => {
+    pinToWindowStart(15 * 60 * 1000);
     for (let i = 0; i < 5; i += 1) {
       await request(app).post("/api/admin/login").send({ login: "admin", password: `wrong-${i}` });
     }
@@ -49,6 +69,32 @@ describe("POST /api/admin/login throttling", () => {
       .post("/api/admin/login")
       .send({ login: config.adminLogin, password: config.adminPassword });
     expect(afterLockout.status).toBe(429);
+  });
+
+  it("arms the lockout across window boundaries — the 429 above is not just the window", async () => {
+    // Within one window the 5/15min budget always masks the lockout (the 6th
+    // request exceeds both). Split the 5 consecutive 401s over TWO windows:
+    // the second window's count stays under budget, so the 429 on the
+    // right-password attempt can only come from the lockout itself.
+    pinToWindowStart(15 * 60 * 1000);
+    for (let i = 0; i < 3; i += 1) {
+      const res = await request(app).post("/api/admin/login").send({ login: "admin", password: `wrong-${i}` });
+      expect(res.status).toBe(401);
+    }
+
+    vi.setSystemTime(Date.now() + 16 * 60 * 1000);
+    for (let i = 3; i < 5; i += 1) {
+      const res = await request(app).post("/api/admin/login").send({ login: "admin", password: `wrong-${i}` });
+      expect(res.status).toBe(401);
+    }
+
+    const locked = await request(app)
+      .post("/api/admin/login")
+      .send({ login: config.adminLogin, password: config.adminPassword });
+    expect(locked.status).toBe(429);
+    // 5 min lock, well under the fresh window's remaining budget: only the
+    // lockout can have produced it.
+    expect(Number(locked.headers["retry-after"])).toBeLessThanOrEqual(5 * 60);
   });
 
   it("still accepts valid credentials on an unthrottled IP", async () => {

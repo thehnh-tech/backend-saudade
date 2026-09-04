@@ -40,7 +40,11 @@ const PURGE_TICK_MS = 15 * 60 * 1000;
 let lastMinuteTickAt = 0;
 let lastPurgeTickAt = 0;
 
-export function aroundOpportunisticJobs(_req: Request, _res: Response, next: NextFunction) {
+export function aroundOpportunisticJobs(req: Request, _res: Response, next: NextFunction) {
+  // The cron sweep runs the ticks itself and awaits them: towing them here
+  // first would leave the handler's own calls bouncing off the re-entrance
+  // locks, answering {ok:true} while the work rides waitUntil.
+  if (req.path.startsWith("/api/internal/")) return next();
   const now = Date.now();
   if (now - lastMinuteTickAt >= MINUTE_TICK_MS) {
     lastMinuteTickAt = now;
@@ -64,7 +68,10 @@ export async function cronSweepHandler(req: Request, res: Response) {
   if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
     return res.status(401).json({ error: "UNAUTHORIZED" });
   }
-  await safeMinuteTick();
-  await safePurgeTick();
-  return res.json({ ok: true });
+  // Both ticks are AWAITED so the response attests the work: a null count
+  // means another tick held the lock on this instance (the cron answers on
+  // whatever lambda Vercel routes it to; the ticks are idempotent).
+  const minute = await safeMinuteTick();
+  const purge = await safePurgeTick();
+  return res.json({ ok: true, minute, purge });
 }

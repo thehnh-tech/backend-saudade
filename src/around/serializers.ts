@@ -37,14 +37,18 @@ export function aroundResponse(
     role?: "owner" | "member" | null;
   } = {}
 ) {
-  const [lng, lat] = around.center.coordinates;
+  // Purged docs never reach a serialiser, but a CLOSED around whose owner
+  // deleted their account keeps serving its surviving members (mine list,
+  // detail) with the centre erased: center IS null on that reachable path,
+  // and every consumer of this shape must treat the field as nullable.
+  const coordinates = around.center?.coordinates;
   return {
     id: String(around._id),
     name: around.name ?? null,
     ownerId: String(around.ownerId),
     ownerPseudo: options.ownerPseudo ?? null,
     status: around.status,
-    center: { lat, lng },
+    center: coordinates ? { lat: coordinates[1], lng: coordinates[0] } : null,
     radiusM: around.radiusM,
     captureWindowMs: around.captureWindowMs,
     createdAt: around.createdAt.toISOString(),

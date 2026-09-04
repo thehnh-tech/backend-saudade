@@ -153,11 +153,33 @@ export const config = {
   aroundMaxWindowMs: numberEnv("AROUND_MAX_WINDOW_MS", process.env.AROUND_MAX_WINDOW_MS, 6 * 60 * 60 * 1000),
   aroundDefaultWindowMs: numberEnv("AROUND_DEFAULT_WINDOW_MS", process.env.AROUND_DEFAULT_WINDOW_MS, 4 * 60 * 60 * 1000),
   aroundRetentionMs: numberEnv("AROUND_RETENTION_MS", process.env.AROUND_RETENTION_MS, 7 * 24 * 60 * 60 * 1000),
-  presenceFreshMs: numberEnv("PRESENCE_FRESH_MS", process.env.PRESENCE_FRESH_MS, 30 * 60 * 1000),
+  // Matches the 1 h presence TTL (models.ts): any presence that still exists
+  // is eligible for fan-out. The background task only posts again after a
+  // 150 m move, so a shorter window silently dropped every stationary phone
+  // — the exact audience a nearby around is for.
+  presenceFreshMs: numberEnv("PRESENCE_FRESH_MS", process.env.PRESENCE_FRESH_MS, 60 * 60 * 1000),
   joinMaxAccuracyM: numberEnv("JOIN_MAX_ACCURACY_M", process.env.JOIN_MAX_ACCURACY_M, 150),
   joinMaxFixAgeMs: numberEnv("JOIN_MAX_FIX_AGE_MS", process.env.JOIN_MAX_FIX_AGE_MS, 60 * 1000),
   joinMinFixSpacingMs: numberEnv("JOIN_MIN_FIX_SPACING_MS", process.env.JOIN_MIN_FIX_SPACING_MS, 8 * 1000),
   joinMaxInterFixSpeedMps: numberEnv("JOIN_MAX_INTER_FIX_SPEED_MPS", process.env.JOIN_MAX_INTER_FIX_SPEED_MPS, 10),
+  // Radar v1.1 (2026-09-03). Session renewal: a user token older than
+  // sessionRenewAfterMs is re-issued on the next authenticated request (as an
+  // X-Session-Token response header) as long as the lineage — the first sign-in
+  // this chain of tokens descends from — is younger than sessionMaxLineageMs.
+  sessionRenewAfterMs: numberEnv("SESSION_RENEW_AFTER_MS", process.env.SESSION_RENEW_AFTER_MS, 24 * 60 * 60 * 1000),
+  sessionMaxLineageMs: numberEnv("SESSION_MAX_LINEAGE_MS", process.env.SESSION_MAX_LINEAGE_MS, 180 * 24 * 60 * 60 * 1000),
+  // Arrival ring: a presence update that lands inside an open around rings
+  // once per (around, user); at most arrivalRingMaxPerHour arrivals per user.
+  // ringToleranceM is the slack added to radiusM + min(accuracy, 150).
+  arrivalRingMaxPerHour: numberEnv("ARRIVAL_RING_MAX_PER_HOUR", process.env.ARRIVAL_RING_MAX_PER_HOUR, 3),
+  ringToleranceM: numberEnv("RING_TOLERANCE_M", process.env.RING_TOLERANCE_M, 30),
+  // Silent "presence probe" pushes sent at creation to radar devices without a
+  // presence fresher than presenceProbeFreshMs, capped per creation.
+  presenceProbeMaxDevices: numberEnv("PRESENCE_PROBE_MAX_DEVICES", process.env.PRESENCE_PROBE_MAX_DEVICES, 500),
+  presenceProbeFreshMs: numberEnv("PRESENCE_PROBE_FRESH_MS", process.env.PRESENCE_PROBE_FRESH_MS, 10 * 60 * 1000),
+  // Wake regions handed back by POST /location: open arounds within this range
+  // become iOS geofences on the phone (max 15).
+  wakeRegionRangeM: numberEnv("WAKE_REGION_RANGE_M", process.env.WAKE_REGION_RANGE_M, 1500),
   reviewModeUserIds: csvEnv(process.env.REVIEW_MODE_USER_IDS),
   moderationAlertEmail: process.env.MODERATION_ALERT_EMAIL ? cleanEnvValue(process.env.MODERATION_ALERT_EMAIL) : "",
   devBypassRadius: flag(process.env.DEV_BYPASS_RADIUS, false)

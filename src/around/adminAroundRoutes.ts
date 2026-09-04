@@ -1,18 +1,30 @@
 import type { Express, Response } from "express";
-import { isValidObjectId } from "mongoose";
+import { Types, isValidObjectId } from "mongoose";
 import { requireRole } from "../auth.js";
+import { config } from "../config.js";
 import type { AuthedRequest } from "../types.js";
+import { haversineMeters } from "./geoUtils.js";
 import { invalidateUserCache, wrap } from "./middleware.js";
-import { logModerationAction } from "./moderation.js";
+import { bilateralBlockSet, logModerationAction } from "./moderation.js";
+import { accuracyCreditM } from "./push.js";
+import { arrivalRingsInLastHour } from "./rings.js";
 import {
+  AroundDeviceModel,
+  AroundMemberModel,
   AroundModel,
   AroundPhotoModel,
   AroundReportModel,
+  AroundRingModel,
   AroundUserModel,
+  DevicePresenceModel,
   type Around,
+  type AroundDevice,
+  type AroundMember,
   type AroundPhoto,
   type AroundReport,
-  type AroundUser
+  type AroundRing,
+  type AroundUser,
+  type DevicePresence
 } from "./models.js";
 import { signedClearUrl } from "./photoDelivery.js";
 import { destroyPhotoAssets, purgeAround } from "./purge.js";
@@ -187,6 +199,107 @@ export function registerAdminAroundRoutes(app: Express) {
     });
   }));
 
+  // GET /api/admin/around/users/:userId/radar?aroundId=<id>
+  // The runbook question in one request: "would this phone ring, and if not
+  // why?". Ages, accuracies and distances only — never a coordinate.
+  app.get("/api/admin/around/users/:userId/radar", requireRole("admin"), wrap(async (req: AuthedRequest, res: Response) => {
+    res.set("Cache-Control", "no-store");
+    if (!isValidObjectId(req.params.userId)) return res.status(404).json({ error: "USER_NOT_FOUND" });
+    const userId = new Types.ObjectId(req.params.userId);
+    const user = await AroundUserModel.findById(userId).lean<AroundUser>();
+    if (!user) return res.status(404).json({ error: "USER_NOT_FOUND" });
+    const now = Date.now();
+
+    const presence = await DevicePresenceModel.findOne({ userId }).lean<DevicePresence>();
+    const devices = await AroundDeviceModel.find({ userId }).sort({ lastActiveAt: -1 }).lean<AroundDevice[]>();
+    const rings = await AroundRingModel.find({ userId }).sort({ claimedAt: -1 }).limit(20).lean<AroundRing[]>();
+
+    let wouldRing: Record<string, unknown> | null = null;
+    const aroundId = typeof req.query.aroundId === "string" ? req.query.aroundId : null;
+    if (aroundId) {
+      const around = isValidObjectId(aroundId) ? await AroundModel.findById(aroundId).lean<Around>() : null;
+      if (!around) {
+        wouldRing = { aroundFound: false };
+      } else {
+        const reasons: string[] = [];
+        if (around.status !== "active" || around.captureEndsAt.getTime() <= now) reasons.push("around_not_open");
+        if (String(around.ownerId) === String(userId)) reasons.push("is_owner");
+        if (around.kickedUserIds.some((id) => String(id) === String(userId))) reasons.push("kicked");
+        if (!user.radarEnabled) reasons.push("radar_off");
+        if (user.status !== "active") reasons.push("user_not_active");
+        const membership = await AroundMemberModel.findOne({ aroundId: around._id, userId }).lean<AroundMember>();
+        if (membership) reasons.push(`member_${membership.status}`);
+        if ((await arrivalRingsInLastHour(userId)) >= config.arrivalRingMaxPerHour) reasons.push("arrival_cap");
+        const blocked = await bilateralBlockSet(userId);
+        if (blocked.has(String(around.ownerId))) reasons.push("blocked");
+        const withToken = devices.filter((device) => device.expoPushToken && device.pushEnabled && !device.invalidatedAt);
+        if (withToken.length === 0) reasons.push("no_push_device");
+        let distanceM: number | null = null;
+        let allowedM: number | null = null;
+        let inside: boolean | null = null;
+        if (!presence) {
+          reasons.push("no_presence");
+        } else if (presence.capturedAt.getTime() < now - config.presenceFreshMs) {
+          reasons.push("presence_stale");
+        }
+        if (presence && around.center) {
+          const [centerLng, centerLat] = around.center.coordinates;
+          const [lng, lat] = presence.location.coordinates;
+          distanceM = Math.round(haversineMeters(lat, lng, centerLat, centerLng));
+          allowedM = Math.round(around.radiusM + accuracyCreditM(presence.accuracy) + config.ringToleranceM);
+          inside = distanceM <= allowedM;
+          if (!inside) reasons.push("outside");
+        }
+        // Queried directly, not looked up in the 20-row display list: an
+        // active account can hold more claims than that, and a missing
+        // already_rung sends the operator hunting a ring path that is working.
+        const rung = await AroundRingModel.findOne({ aroundId: around._id, userId }).lean<AroundRing>();
+        if (rung) reasons.push(`already_rung_${rung.kind}`);
+        wouldRing = { aroundFound: true, status: around.status, inside, distanceM, allowedM, reasons };
+      }
+    }
+
+    return res.json({
+      user: {
+        id: String(user._id),
+        pseudo: user.pseudo,
+        status: user.status,
+        radarEnabled: user.radarEnabled,
+        radarConsentAt: user.radarConsentAt ? user.radarConsentAt.toISOString() : null,
+        lastSeenAt: user.lastSeenAt.toISOString()
+      },
+      presence: presence
+        ? {
+            ageS: Math.round((now - presence.updatedAt.getTime()) / 1000),
+            capturedAgeS: Math.round((now - presence.capturedAt.getTime()) / 1000),
+            fresh: presence.capturedAt.getTime() >= now - config.presenceFreshMs,
+            accuracy: presence.accuracy,
+            source: presence.source,
+            installationId: presence.installationId ?? null
+          }
+        : null,
+      devices: devices.map((device) => ({
+        installationId: device.installationId,
+        hasToken: Boolean(device.expoPushToken),
+        pushEnabled: device.pushEnabled,
+        invalidatedAt: device.invalidatedAt ? device.invalidatedAt.toISOString() : null,
+        lastActiveAt: device.lastActiveAt.toISOString(),
+        platform: device.platform ?? null,
+        appVersion: device.appVersion ?? null,
+        osVersion: device.osVersion ?? null
+      })),
+      rings: rings.map((ring) => ({
+        aroundId: String(ring.aroundId),
+        kind: ring.kind,
+        source: ring.source ?? null,
+        claimedAt: ring.claimedAt.toISOString(),
+        sentAt: ring.sentAt ? ring.sentAt.toISOString() : null,
+        tickets: ring.ticketIds.length
+      })),
+      wouldRing
+    });
+  }));
+
   // DELETE /api/admin/around/arounds/:id — immediate purge, SAME logic as the
   // J+7 job (Cloudinary first).
   app.delete("/api/admin/around/arounds/:id", requireRole("admin"), wrap(async (req: AuthedRequest, res: Response) => {
@@ -196,13 +309,9 @@ export function registerAdminAroundRoutes(app: Express) {
 
     const purged = await purgeAround(around);
     // Terms §6: "a name that breaches these Terms is removed together with the
-    // around it names". purgeAround destroys the photos and the memberships but
-    // keeps the document for stats — with its name still on it. Clear the name
-    // here (this route IS the moderation decision) and keep the offending text
-    // in the moderation journal, which is the evidence trail.
-    if (purged && around.name) {
-      await AroundModel.updateOne({ _id: around._id }, { $set: { name: null } });
-    }
+    // around it names". purgeAround itself nulls the name (and erases the
+    // centre); the offending text survives only in the moderation journal,
+    // which is the evidence trail.
     await logModerationAction("around-purged", "around", around._id, {
       complete: purged,
       name: around.name ?? null

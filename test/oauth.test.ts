@@ -1,5 +1,5 @@
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { jwtVerifyMock } = vi.hoisted(() => ({ jwtVerifyMock: vi.fn() }));
 
@@ -38,6 +38,31 @@ beforeEach(async () => {
   resetUserCache();
   jwtVerifyMock.mockReset();
 });
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+const APPLE_TOKEN_URL = "https://appleid.apple.com/auth/token";
+
+type FetchCall = { url: string; body: URLSearchParams };
+
+// Same shape as appleRevoke.test.ts's stub, extended with .json(): the code
+// exchange reads the response body, the revoke call never does.
+function stubAppleTokenFetch(response: { ok: boolean; status?: number; refreshToken?: string } | Error) {
+  const calls: FetchCall[] = [];
+  const fetchMock = vi.fn(async (input: unknown, init?: { body?: string }) => {
+    calls.push({ url: String(input), body: new URLSearchParams(init?.body ?? "") });
+    if (response instanceof Error) throw response;
+    return {
+      ok: response.ok,
+      status: response.status ?? (response.ok ? 200 : 400),
+      json: async () => ({ refresh_token: response.refreshToken ?? "apple-rt-1" })
+    } as unknown as Response;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return calls;
+}
 
 function mockIdentity(payload: Record<string, unknown>) {
   jwtVerifyMock.mockResolvedValue({ payload, protectedHeader: { alg: "RS256" } });
@@ -186,5 +211,109 @@ describe("POST /api/users/oauth", () => {
       .send({ provider: "apple", identityToken: "apple-token", pseudo: "x" });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("INVALID_PSEUDO");
+  });
+});
+
+// App Store 5.1.1(v): the authorization code from the native sheet is what
+// buys the refresh_token needed to revoke the grant at account deletion.
+describe("POST /api/users/oauth — Apple authorization code exchange", () => {
+  it("exchanges the code on the signup call and stores the refresh token", async () => {
+    const calls = stubAppleTokenFetch({ ok: true, refreshToken: "apple-rt-signup" });
+    mockIdentity({ sub: "apple-sub-code" });
+
+    const res = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "apple", identityToken: "apple-token", pseudo: "coded", authorizationCode: "auth-code-123456" });
+    expect(res.status).toBe(201);
+
+    const exchange = calls.find((call) => call.url === APPLE_TOKEN_URL);
+    expect(exchange).toBeDefined();
+    expect(exchange?.body.get("grant_type")).toBe("authorization_code");
+    expect(exchange?.body.get("code")).toBe("auth-code-123456");
+    expect(exchange?.body.get("client_id")).toBe("tech.thehnh.saudade");
+    // The client_secret is a freshly signed ES256 assertion, never a raw key.
+    expect(exchange?.body.get("client_secret")?.split(".")).toHaveLength(3);
+
+    const stored = await AroundUserModel.findById(res.body.user.id).select("+appleRefreshToken").lean();
+    expect(stored?.appleRefreshToken).toBe("apple-rt-signup");
+  });
+
+  it("never burns the single-use code on the PSEUDO_REQUIRED first call", async () => {
+    const calls = stubAppleTokenFetch({ ok: true });
+    mockIdentity({ sub: "apple-sub-first-call" });
+
+    const first = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "apple", identityToken: "apple-token", authorizationCode: "auth-code-123456" });
+    expect(first.status).toBe(409);
+    expect(first.body.error).toBe("PSEUDO_REQUIRED");
+    expect(calls.filter((call) => call.url === APPLE_TOKEN_URL)).toHaveLength(0);
+  });
+
+  it("never burns the code on a pre-create refusal either (EMAIL_ALREADY_LINKED)", async () => {
+    const calls = stubAppleTokenFetch({ ok: true });
+    // First account claims the address, WITHOUT a code (no exchange).
+    mockIdentity({ sub: "apple-sub-linked", email: "linked-code@example.com", email_verified: "true" });
+    const first = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "apple", identityToken: "apple-token", pseudo: "firstowner" });
+    expect(first.status).toBe(201);
+
+    // A second APPLE identity on the same address: refused BEFORE the create,
+    // so the exchange — which only runs after a successful create — must not
+    // have consumed this retryable single-use code.
+    mockIdentity({ sub: "apple-sub-linked-2", email: "linked-code@example.com", email_verified: "true" });
+    const clash = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "apple", identityToken: "apple-token", pseudo: "secondowner", authorizationCode: "auth-code-999999" });
+    expect(clash.status).toBe(409);
+    expect(clash.body.error).toBe("EMAIL_ALREADY_LINKED");
+    expect(calls.filter((call) => call.url === APPLE_TOKEN_URL)).toHaveLength(0);
+  });
+
+  it("still answers 201 when the exchange fails — signup is never blocked", async () => {
+    stubAppleTokenFetch({ ok: false, status: 400 });
+    mockIdentity({ sub: "apple-sub-fail" });
+
+    const res = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "apple", identityToken: "apple-token", pseudo: "unlucky", authorizationCode: "auth-code-123456" });
+    expect(res.status).toBe(201);
+
+    const stored = await AroundUserModel.findById(res.body.user.id).select("+appleRefreshToken").lean();
+    expect(stored).not.toBeNull();
+    expect(stored?.appleRefreshToken ?? null).toBeNull();
+  });
+
+  it("captures a fresh token at login for an account that has none", async () => {
+    stubAppleTokenFetch({ ok: true, refreshToken: "apple-rt-login" });
+    await createUser("tokenless", { appleSub: "apple-sub-tokenless" });
+    mockIdentity({ sub: "apple-sub-tokenless" });
+
+    const res = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "apple", identityToken: "apple-token", authorizationCode: "auth-code-654321" });
+    expect(res.status).toBe(200);
+
+    const stored = await AroundUserModel.findOne({ appleSub: "apple-sub-tokenless" }).select("+appleRefreshToken").lean();
+    expect(stored?.appleRefreshToken).toBe("apple-rt-login");
+  });
+
+  it("keeps the stored token when a later exchange fails (no clobber)", async () => {
+    stubAppleTokenFetch({ ok: false, status: 400 });
+    const account = await createUser("keeper", { appleSub: "apple-sub-keeper" });
+    await AroundUserModel.updateOne(
+      { _id: account.user._id },
+      { $set: { appleRefreshToken: "apple-rt-kept" } }
+    );
+    mockIdentity({ sub: "apple-sub-keeper" });
+
+    const res = await request(app)
+      .post("/api/users/oauth")
+      .send({ provider: "apple", identityToken: "apple-token", authorizationCode: "auth-code-654321" });
+    expect(res.status).toBe(200);
+
+    const stored = await AroundUserModel.findById(account.user._id).select("+appleRefreshToken").lean();
+    expect(stored?.appleRefreshToken).toBe("apple-rt-kept");
   });
 });

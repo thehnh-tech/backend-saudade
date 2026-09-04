@@ -473,6 +473,29 @@ describe("POST /api/users/email/login", () => {
     expect(me.status).toBe(200);
   });
 
+  it("locks the account after 5 consecutive wrong passwords — the RIGHT password then answers 429", async () => {
+    await register();
+    await request(app).post("/api/users/email/verify").send({ email: EMAIL, code: lastCode() });
+
+    for (let i = 0; i < 5; i += 1) {
+      const res = await request(app)
+        .post("/api/users/email/login")
+        .send({ email: EMAIL, password: "wrong-password" });
+      expect(res.status).toBe(401);
+    }
+
+    const locked = await request(app).post("/api/users/email/login").send({ email: EMAIL, password: PASSWORD });
+    expect(locked.status).toBe(429);
+    expect(Number(locked.headers["retry-after"])).toBeGreaterThan(0);
+
+    // Another address is untouched: the lockout is keyed on the e-mail, not
+    // the IP, so a NAT full of guests cannot lock one another out.
+    const other = await request(app)
+      .post("/api/users/email/login")
+      .send({ email: "someone-else@example.com", password: PASSWORD });
+    expect(other.status).toBe(401);
+  });
+
   it("refuses an Apple-only account with the generic 401 (no password to compare)", async () => {
     await createUser("appleonly", { email: "apple@example.com" });
     const res = await request(app)

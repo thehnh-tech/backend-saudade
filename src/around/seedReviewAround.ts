@@ -53,11 +53,32 @@ async function main() {
   const captureEndsAt = new Date(now.getTime() + config.aroundMaxWindowMs);
   const expiresAt = new Date(captureEndsAt.getTime() + config.aroundRetentionMs);
 
-  let around = await AroundModel.findOne({ ownerId: owner._id, status: "active" }).lean();
+  // Matching on "active" alone broke the one case this script exists for:
+  // re-running it on review day, AFTER the 6 h window has elapsed. The minute
+  // tick flips a finished around to "closed", the lookup then missed, and the
+  // else branch below quietly created a SECOND demo around — orphaning the one
+  // already described to the reviewer, with its members. A closed around is
+  // reopened instead, most recent first.
+  let around = await AroundModel.findOne({
+    ownerId: owner._id,
+    status: { $in: ["active", "closed"] }
+  })
+    .sort({ createdAt: -1 })
+    .lean();
   if (around) {
     await AroundModel.updateOne(
       { _id: around._id },
-      { $set: { captureEndsAt, expiresAt, captureWindowMs: captureEndsAt.getTime() - now.getTime(), endingNotifiedAt: null } }
+      {
+        $set: {
+          status: "active",
+          captureEndsAt,
+          expiresAt,
+          captureWindowMs: captureEndsAt.getTime() - now.getTime(),
+          endingNotifiedAt: null,
+          closeReminderSentAt: null,
+          pendingReminder24hSentAt: null
+        }
+      }
     );
     console.log(`[seed:review] refreshed demo around ${String(around._id)} (window extended to ${captureEndsAt.toISOString()})`);
   } else {
@@ -81,10 +102,8 @@ async function main() {
       userId: owner._id,
       role: "owner",
       status: "active",
-      joinFixes: [{ lat: DEMO_LAT, lng: DEMO_LNG, accuracy: 5, capturedAt: now, distanceM: 0 }],
+      joinFixes: [{ accuracy: 5, capturedAt: now, distanceM: 0 }],
       interFixDistanceM: null,
-      joinIp: null,
-      joinGeo: null,
       suspicious: false,
       createdAt: now
     });
@@ -93,7 +112,11 @@ async function main() {
 
   console.log(`[seed:review] demo owner id: ${String(owner._id)}`);
   console.log("[seed:review] add ONLY the review account user ids to REVIEW_MODE_USER_IDS — the demo around owned by pma-demo is resolved server-side.");
-  console.log("[seed:review] the demo around is effectively permanent (+10 years); re-running simply refreshes it.");
+  console.log(
+    `[seed:review] window open until ${captureEndsAt.toISOString()} (${Math.round(config.aroundMaxWindowMs / 3_600_000)} h, ` +
+    "the same maximum any around gets). Re-run this on the day of the review session: it reopens THIS around, " +
+    "closed or not, rather than creating another one."
+  );
   await mongoose.disconnect();
 }
 
