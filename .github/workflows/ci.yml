@@ -1,0 +1,25 @@
+# Typecheck + the full vitest suite (mongodb-memory-server downloads a mongod
+# binary on first run: the cache below turns that into a rare event, and the
+# vitest config's 300s hook timeout absorbs a cold download when it happens).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongodb-binaries-${{ runner.os }}
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

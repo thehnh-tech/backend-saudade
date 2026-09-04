@@ -4,6 +4,7 @@ import {
   AroundModel,
   AroundPhotoModel,
   AroundReportModel,
+  AroundRingModel,
   type Around,
   type AroundPhoto
 } from "./models.js";
@@ -63,7 +64,15 @@ export async function purgeAround(around: Pick<Around, "_id">): Promise<boolean>
 
   await AroundMemberModel.deleteMany({ aroundId: around._id });
   await AroundReportModel.deleteMany({ aroundId: around._id });
-  await AroundModel.updateOne({ _id: around._id }, { $set: { status: "purged" } });
+  await AroundRingModel.deleteMany({ aroundId: around._id });
+  // The kept doc is counters and dates only: the centre is the owner's exact
+  // position, the name is user text, and kickedUserIds is a member list —
+  // none of it may outlive the purge. (Purged arounds 404 every join path, so
+  // losing the kick list changes nothing.)
+  await AroundModel.updateOne(
+    { _id: around._id },
+    { $set: { status: "purged", name: null, kickedUserIds: [] }, $unset: { center: "" } }
+  );
   return true;
 }
 

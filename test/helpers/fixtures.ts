@@ -82,10 +82,8 @@ export async function createAroundFixture(
     userId: ownerId,
     role: "owner",
     status: "active",
-    joinFixes: [{ lat: LAUSANNE.lat, lng: LAUSANNE.lng, accuracy: 5, capturedAt: now, distanceM: 0 }],
+    joinFixes: [{ accuracy: 5, capturedAt: now, distanceM: 0 }],
     interFixDistanceM: null,
-    joinIp: null,
-    joinGeo: null,
     suspicious: false,
     createdAt: now
   });
@@ -100,8 +98,6 @@ export async function addMember(aroundId: Types.ObjectId, userId: Types.ObjectId
     status,
     joinFixes: [],
     interFixDistanceM: null,
-    joinIp: null,
-    joinGeo: null,
     suspicious: false,
     createdAt: new Date()
   });

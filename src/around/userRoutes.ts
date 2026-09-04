@@ -14,16 +14,22 @@ import {
   AroundModel,
   AroundReportModel,
   AroundReservedPseudoModel,
+  AroundRingModel,
   AroundUserModel,
   DevicePresenceModel,
   LOCALES,
   ModerationActionModel,
+  PRESENCE_SOURCES,
+  PushReceiptModel,
   REPORT_REASONS,
   type AroundDevice,
   type AroundUser
 } from "./models.js";
 import { invalidateUserCache, requireUser, wrap, type AroundRequest } from "./middleware.js";
 import { createReport, sendReportAlertEmail } from "./moderation.js";
+import { ringOnPresence } from "./push.js";
+import { wakeRegionsNear, type WakeRegion } from "./rings.js";
+import { runDetached } from "./serverless.js";
 import {
   OAuthVerificationError,
   exchangeAppleAuthorizationCode,
@@ -68,7 +74,18 @@ const locationSchema = z.object({
   lat: z.number().min(-90).max(90),
   lng: z.number().min(-180).max(180),
   accuracy: z.number().min(0).max(100000),
-  source: z.enum(["significant-change", "foreground"]).optional()
+  // Bounded honesty: iOS delivers background batches late, and stamping them
+  // at receipt inflated the fan-out freshness window. Out-of-bounds, absent
+  // OR unparseable falls back to receipt time — never a rejection: a skewed
+  // or garbled clock must not make a phone invisible.
+  capturedAt: z.coerce.date().optional().catch(undefined),
+  // "significant-change" was never sent by any shipped client (the schema
+  // default stamped every row "foreground"): retired from the wire. The v1.1
+  // sources (heartbeat, probe, geofence) are the wake paths, see models.ts.
+  source: z.enum(PRESENCE_SOURCES).optional(),
+  installationId: z.string().trim().min(6).max(128).optional(),
+  // Set by the app when the post answers a silent presence probe.
+  probeAroundId: z.string().trim().max(64).optional()
 });
 
 const reportSchema = z.object({
@@ -144,13 +161,10 @@ export function registerAroundUserRoutes(app: Express) {
 
     const pseudoLower = pseudo.toLowerCase();
 
-    const refreshToken = await appleRefreshTokenFrom(parsed.data.provider, parsed.data.authorizationCode);
-
     try {
       const now = new Date();
       const created = await AroundUserModel.create({
         [subField]: identity.sub,
-        appleRefreshToken: refreshToken,
         pseudo,
         pseudoLower,
         email: identity.email,
@@ -161,6 +175,19 @@ export function registerAroundUserRoutes(app: Express) {
         createdAt: now,
         lastSeenAt: now
       });
+      // Exchange AFTER the create: the Apple authorization code is single-use,
+      // and burning it on an attempt that dies on PSEUDO_TAKEN would leave the
+      // retry (new pseudo, same code) with nothing to exchange. Best effort —
+      // a failure here must never undo a signup that already succeeded; the
+      // next successful sign-in captures a fresh token.
+      try {
+        const refreshToken = await appleRefreshTokenFrom(parsed.data.provider, parsed.data.authorizationCode);
+        if (refreshToken) {
+          await AroundUserModel.updateOne({ _id: created._id }, { $set: { appleRefreshToken: refreshToken } });
+        }
+      } catch (error) {
+        console.error("[around:oauth] post-create apple token exchange failed", error);
+      }
       const createdUser = created.toObject() as AroundUser;
       return res.status(201).json({ token: authTokenFor(createdUser), user: userResponse(createdUser), created: true });
     } catch (error) {
@@ -248,11 +275,15 @@ export function registerAroundUserRoutes(app: Express) {
     };
     if (data.expoPushToken) update.expoPushToken = data.expoPushToken;
 
+    // An absent token is "no change", never a revocation: registration runs
+    // on every launch, and a transient Expo push-service failure registers
+    // without a token — unsetting there wiped a valid binding and silently
+    // dropped the user from every fan-out until a later launch happened to
+    // succeed. pushEnabled:false already mutes push delivery on its own.
     const device = await AroundDeviceModel.findOneAndUpdate(
       { userId: user._id, installationId: data.installationId },
       {
         $set: update,
-        ...(data.expoPushToken ? {} : { $unset: { expoPushToken: "" } }),
         $setOnInsert: { userId: user._id, installationId: data.installationId }
       },
       { upsert: true, returnDocument: "after" }
@@ -312,25 +343,99 @@ export function registerAroundUserRoutes(app: Express) {
     const parsed = locationSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
     const user = req.user as AroundUser;
-    if (!user.radarEnabled) return res.status(403).json({ error: "RADAR_DISABLED" });
 
+    // Consent gated on the DB, not on the 60 s per-instance cache: on the
+    // serverless deployment another warm lambda can hold the pre-toggle
+    // snapshot in either direction — refusing posts for a minute right after
+    // enabling, or re-creating a presence the opt-out just deleted.
     const now = new Date();
-    await DevicePresenceModel.updateOne(
-      { userId: user._id },
-      {
-        $set: {
-          location: geoPoint(parsed.data.lat, parsed.data.lng),
-          accuracy: parsed.data.accuracy,
-          capturedAt: now,
-          updatedAt: now,
-          source: parsed.data.source ?? "foreground"
-        },
-        $setOnInsert: { userId: user._id }
-      },
-      { upsert: true }
+    const consent = await AroundUserModel.updateOne(
+      { _id: user._id, radarEnabled: true },
+      { $set: { lastSeenAt: now } }
     );
-    await AroundUserModel.updateOne({ _id: user._id }, { $set: { lastSeenAt: now } });
-    return res.json({ ok: true });
+    if (consent.matchedCount !== 1) {
+      // Mop up a presence a concurrent post may have re-created: no position
+      // is kept for a non-consenting user.
+      await DevicePresenceModel.deleteOne({ userId: user._id });
+      return res.status(403).json({ error: "RADAR_DISABLED" });
+    }
+
+    const claimed = parsed.data.capturedAt;
+    const capturedAt =
+      claimed &&
+      claimed.getTime() <= now.getTime() + 30_000 &&
+      claimed.getTime() >= now.getTime() - config.presenceFreshMs
+        ? claimed
+        : now;
+
+    const source = parsed.data.source ?? "foreground";
+    try {
+      await DevicePresenceModel.updateOne(
+        { userId: user._id },
+        {
+          $set: {
+            location: geoPoint(parsed.data.lat, parsed.data.lng),
+            accuracy: parsed.data.accuracy,
+            capturedAt,
+            updatedAt: now,
+            source,
+            installationId: parsed.data.installationId ?? null
+          },
+          $setOnInsert: { userId: user._id }
+        },
+        { upsert: true }
+      );
+    } catch (error) {
+      // Two first-ever posts racing on two lambdas (the task and the Home
+      // piggyback right after enabling): the loser's upsert collides with the
+      // unique userId index. The document exists now — a plain update wins.
+      if (!isDuplicateKeyError(error)) throw error;
+      await DevicePresenceModel.updateOne(
+        { userId: user._id },
+        {
+          $set: {
+            location: geoPoint(parsed.data.lat, parsed.data.lng),
+            accuracy: parsed.data.accuracy,
+            capturedAt,
+            updatedAt: now,
+            source,
+            installationId: parsed.data.installationId ?? null
+          }
+        }
+      );
+    }
+    // Write-then-verify: a radar-off that committed between the consent gate
+    // above and this upsert deleted a presence we just re-created. Both
+    // orders of the interleaving end with no stored position.
+    const stillConsenting = await AroundUserModel.exists({ _id: user._id, radarEnabled: true });
+    if (!stillConsenting) {
+      await DevicePresenceModel.deleteOne({ userId: user._id });
+      return res.status(403).json({ error: "RADAR_DISABLED" });
+    }
+
+    // The arrival ring rides behind the response (waitUntil on Vercel): the
+    // POST answers in one round trip, the push — if any — follows.
+    runDetached(
+      ringOnPresence({
+        userId: user._id,
+        lat: parsed.data.lat,
+        lng: parsed.data.lng,
+        accuracy: parsed.data.accuracy,
+        source,
+        probeAroundId: parsed.data.probeAroundId ?? null
+      }).catch((error) => {
+        console.error("[around:ring] arrival ring failed", error);
+      })
+    );
+    // Wake regions: the open arounds around the phone, so it can arm iOS
+    // region monitoring (a region entry relaunches even a force-quit app).
+    let wakeRegions: WakeRegion[] = [];
+    try {
+      wakeRegions = await wakeRegionsNear(parsed.data.lat, parsed.data.lng, now);
+    } catch (error) {
+      console.error("[around:ring] wake regions failed", error);
+    }
+    return res.json({ ok: true, wakeRegions });
   }));
 
   // Account deletion (App Store 5.1.1(v)) — full cascade: photos (Cloudinary
@@ -372,16 +477,35 @@ export function registerAroundUserRoutes(app: Express) {
     }
     await AroundMemberModel.updateMany(
       { userId },
-      { $set: { status: "left", joinFixes: [], joinIp: null, joinGeo: null, anonymizedAt: now } }
+      { $set: { status: "left", joinFixes: [], anonymizedAt: now } }
     );
 
     await AroundModel.updateMany(
       { ownerId: userId, status: "active" },
       { $set: { status: "closed", captureEndsAt: now } }
     );
+    // Erasure: the centre of every around this account created IS its owner's
+    // exact position, and the name is their text. Closing is not enough — the
+    // J+7 purge would only reach them at expiry, and closed docs would keep
+    // both for ever. (The docs above just went from active to closed, so they
+    // are covered by this sweep.)
+    await AroundModel.updateMany(
+      { ownerId: userId, status: { $in: ["active", "closed", "purging"] } },
+      { $unset: { center: "" }, $set: { name: null } }
+    );
 
     await AroundDeviceModel.deleteMany({ userId });
     await DevicePresenceModel.deleteOne({ userId });
+    // Ring claims carry this user's id for 8 days (the TTL) or until the
+    // around is purged, whichever comes first — neither of which is "now".
+    // An erasure that leaves the id behind is not an erasure, and the only
+    // thing the row buys after the account is gone is silence on a person who
+    // no longer exists.
+    await AroundRingModel.deleteMany({ userId });
+    // Same reasoning: a receipt row is a push token plus this user's id, kept
+    // 7 days by its own TTL. Nothing is left to deliver to a deleted account,
+    // so nothing needs to be remembered about it.
+    await PushReceiptModel.deleteMany({ userId });
     await AroundBlockModel.deleteMany({ $or: [{ blockerId: userId }, { blockedId: userId }] });
     // A pending verification code outlives nothing: it carries the (lowercased)
     // address of a deleted account and, if the address were re-registered

@@ -38,5 +38,6 @@ export function duplicateKeyFields(error: unknown): string[] {
 }
 
 export function authTokenFor(user: Pick<AroundUser, "_id">) {
-  return signAuth({ role: "user", userId: String(user._id) });
+  // A fresh sign-in starts a new lineage (`sat`); renewals keep it.
+  return signAuth({ role: "user", userId: String(user._id), sat: Math.floor(Date.now() / 1000) });
 }

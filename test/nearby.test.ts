@@ -23,6 +23,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  vi.useRealTimers();
   await clearCollections();
   resetAroundRateLimits();
   resetUserCache();
@@ -107,20 +108,42 @@ describe("GET /api/arounds/nearby — center privacy + rate limit", () => {
     expect(Math.abs(joined.distanceM - 123)).toBeLessThan(5);
   });
 
-  it("refuses a queried point inconsistent with the caller's IP (403 GEO_MISMATCH)", async () => {
+  it("serves a queried point inconsistent with the caller's IP, degraded and flagged (no more blank radar)", async () => {
     const owner = await createUser("owner");
     await createAroundFixture(owner.user._id);
-    const scanner = await createUser("scanner");
+    const roamer = await createUser("roamer");
 
-    // 8.8.8.8 geolocates to the US: querying Lausanne coordinates from there is
-    // the city-scan / trilateration pattern /join already refuses.
+    // 8.8.8.8 geolocates to the US: a VPN exit or an overseas carrier IP
+    // looks exactly like the city-scan pattern. /nearby serves anyway — the
+    // response already withholds the oracle (bucketed distance, no centre) —
+    // and marks the session; /join keeps the hard wall (see join.test.ts).
     const res = await request(app)
       .get("/api/arounds/nearby")
       .query(nearbyQuery)
       .set("X-Forwarded-For", "8.8.8.8")
-      .set("Authorization", scanner.auth);
-    expect(res.status).toBe(403);
-    expect(res.body.error).toBe("GEO_MISMATCH");
+      .set("Authorization", roamer.auth);
+    expect(res.status).toBe(200);
+    expect(res.body.geoDegraded).toBe(true);
+    expect(res.body.arounds).toHaveLength(1);
+    const served = res.body.arounds[0];
+    expect(served.joined).toBe(false);
+    expect(served.center).toBeUndefined();
+    expect(served.distanceM % 50).toBe(0);
+  });
+
+  it("leaves geoDegraded unset when the IP is consistent with the queried point", async () => {
+    const owner = await createUser("owner");
+    await createAroundFixture(owner.user._id);
+    const local = await createUser("local");
+
+    // No X-Forwarded-For: 127.0.0.1 has no geoip entry, which is the same
+    // "nothing to compare" case as a consistent IP.
+    const res = await request(app)
+      .get("/api/arounds/nearby")
+      .query(nearbyQuery)
+      .set("Authorization", local.auth);
+    expect(res.status).toBe(200);
+    expect(res.body.geoDegraded).toBeUndefined();
   });
 
   it("exempts a review-mode account from the GeoIP check", async () => {
@@ -135,12 +158,23 @@ describe("GET /api/arounds/nearby — center privacy + rate limit", () => {
       .set("X-Forwarded-For", "8.8.8.8")
       .set("Authorization", reviewer.auth);
     expect(res.status).toBe(200);
+    // Since the degrade change everybody gets a 200: the exemption now shows
+    // in the absence of the flag (no geoDegraded, no throttled warn for the
+    // App Review account probing Lausanne from California).
+    expect(res.body.geoDegraded).toBeUndefined();
   });
 
   it("caps GET /api/arounds/nearby at 15/min per user (429 RATE_LIMITED + Retry-After)", async () => {
     const owner = await createUser("owner");
     await createAroundFixture(owner.user._id);
     const walker = await createUser("walker");
+
+    // The shared limiter's fixed windows align on the wall clock: pin Date
+    // to the current window's start so the 16-request loop cannot straddle a
+    // minute boundary and split its count over two windows (a real ~1% CI
+    // flake otherwise). Only Date is faked — timers and Mongo stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Math.floor(Date.now() / 60_000) * 60_000);
 
     for (let i = 0; i < 15; i += 1) {
       const res = await request(app)
@@ -164,6 +198,8 @@ describe("GET /api/arounds/nearby — center privacy + rate limit", () => {
       .query(nearbyQuery)
       .set("Authorization", other.auth);
     expect(otherRes.status).toBe(200);
+
+    vi.useRealTimers();
   });
 });
 

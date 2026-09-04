@@ -16,6 +16,7 @@ import {
   AroundPhotoModel,
   AroundReportModel,
   AroundReservedPseudoModel,
+  AroundRingModel,
   AroundUserModel,
   DevicePresenceModel,
   ModerationActionModel
@@ -46,10 +47,12 @@ beforeEach(async () => {
 describe("J+7 purge job (Cloudinary first)", () => {
   it("destroys rear AND front on Cloudinary before deleting the Mongo docs", async () => {
     const owner = await createUser("owner");
+    const kicked = await createUser("kicked");
     const around = await createAroundFixture(owner.user._id, {
       status: "closed",
       captureEndsAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000),
-      expiresAt: new Date(Date.now() - 60_000)
+      expiresAt: new Date(Date.now() - 60_000),
+      kickedUserIds: [kicked.user._id]
     });
     const photo = await createPhotoFixture(around._id, owner.user._id, { status: "approved" });
 
@@ -66,6 +69,47 @@ describe("J+7 purge job (Cloudinary first)", () => {
     expect(await AroundMemberModel.countDocuments({ aroundId: around._id })).toBe(0);
     const purged = await AroundModel.findById(around._id).lean();
     expect(purged?.status).toBe("purged");
+    // Privacy erasure: the kept doc is counters and dates only — no centre
+    // (the owner's exact position), no name, no member list.
+    expect(purged?.center).toBeUndefined();
+    expect(purged?.name).toBeNull();
+    expect(purged?.kickedUserIds).toEqual([]);
+    expect(purged?.memberCount).toBe(1);
+  });
+
+  it("legacy sweep: erases coordinates from docs written before the strip-at-write change", async () => {
+    const owner = await createUser("owner");
+    const around = await createAroundFixture(owner.user._id, { status: "purged" });
+    // Old-shape docs bypass the current schema via the raw collections.
+    await AroundModel.collection.updateOne(
+      { _id: around._id },
+      { $set: { center: { type: "Point", coordinates: [6.63, 46.52] }, name: "Vieux nom", kickedUserIds: [owner.user._id] } }
+    );
+    await AroundMemberModel.collection.updateOne(
+      { aroundId: around._id, userId: owner.user._id },
+      {
+        $set: {
+          joinIp: "1.2.3.4",
+          joinGeo: { city: "Lausanne" },
+          joinFixes: [{ lat: 46.52, lng: 6.63, accuracy: 5, capturedAt: new Date(), distanceM: 12 }]
+        }
+      }
+    );
+
+    await runAroundPurgeTick();
+
+    const storedAround = await AroundModel.findById(around._id).lean();
+    expect(storedAround?.center).toBeUndefined();
+    expect(storedAround?.name).toBeNull();
+    expect(storedAround?.kickedUserIds).toEqual([]);
+
+    const member = await AroundMemberModel.collection.findOne({ aroundId: around._id });
+    expect(member).not.toBeNull();
+    expect(member).not.toHaveProperty("joinIp");
+    expect(member).not.toHaveProperty("joinGeo");
+    expect(member?.joinFixes[0]).not.toHaveProperty("lat");
+    expect(member?.joinFixes[0]).not.toHaveProperty("lng");
+    expect(member?.joinFixes[0]).toMatchObject({ accuracy: 5, distanceM: 12 });
   });
 
   it("resumes after a partial Cloudinary failure (purgeState-driven retry)", async () => {
@@ -164,6 +208,16 @@ describe("account deletion cascade (App Store 5.1.1(v))", () => {
       updatedAt: new Date(),
       source: "foreground"
     });
+    // A ring claim carries the user's id and lives 8 days on its own TTL:
+    // erasure has to take it, or a deleted account leaves a trace behind.
+    await AroundRingModel.create({
+      aroundId: around._id,
+      userId: alice.user._id,
+      kind: "created",
+      claimedAt: new Date(),
+      sentAt: new Date(),
+      ticketIds: ["ticket-alice"]
+    });
 
     const res = await request(app).delete("/api/users/me").set("Authorization", alice.auth);
     expect(res.status).toBe(200);
@@ -175,27 +229,60 @@ describe("account deletion cascade (App Store 5.1.1(v))", () => {
     expect(await AroundPhotoModel.countDocuments({ uploaderId: alice.user._id })).toBe(0);
     expect(await AroundDeviceModel.countDocuments({ userId: alice.user._id })).toBe(0);
     expect(await DevicePresenceModel.countDocuments({ userId: alice.user._id })).toBe(0);
+    expect(await AroundRingModel.countDocuments({ userId: alice.user._id })).toBe(0);
     expect(await AroundUserModel.countDocuments({ _id: alice.user._id })).toBe(0);
 
     const membership = await AroundMemberModel.findOne({ aroundId: around._id, userId: alice.user._id }).lean();
     expect(membership?.status).toBe("left");
     expect(membership?.joinFixes).toHaveLength(0);
-    expect(membership?.joinIp).toBeNull();
 
     // The dead token is rejected afterwards.
     const me = await request(app).get("/api/users/me").set("Authorization", alice.auth);
     expect(me.status).toBe(401);
   });
 
-  it("closes the arounds owned by a deleted user", async () => {
+  it("closes the arounds owned by a deleted user and strips their centre and name", async () => {
     const owner = await createUser("owner");
-    const around = await createAroundFixture(owner.user._id);
+    const active = await createAroundFixture(owner.user._id);
+    const closed = await createAroundFixture(owner.user._id, {
+      status: "closed",
+      captureEndsAt: new Date(Date.now() - 60_000)
+    });
 
     const res = await request(app).delete("/api/users/me").set("Authorization", owner.auth);
     expect(res.status).toBe(200);
 
-    const stored = await AroundModel.findById(around._id).lean();
-    expect(stored?.status).toBe("closed");
+    // The centre IS the deleted owner's exact position: closing is not
+    // enough, and the already-closed around must be erased too.
+    for (const id of [active._id, closed._id]) {
+      const stored = await AroundModel.findById(id).lean();
+      expect(stored?.status).toBe("closed");
+      expect(stored?.center).toBeUndefined();
+      expect(stored?.name).toBeNull();
+    }
+  });
+
+  it("keeps serving a centre-stripped around to its surviving members (center:null, no 500)", async () => {
+    const owner = await createUser("owner");
+    const alice = await createUser("alice");
+    const around = await createAroundFixture(owner.user._id);
+    await addMember(around._id, alice.user._id);
+
+    const res = await request(app).delete("/api/users/me").set("Authorization", owner.auth);
+    expect(res.status).toBe(200);
+
+    // The owner-erased around stays readable for 7 days: the whole serving
+    // path must degrade to center:null, never crash on the missing field.
+    const mine = await request(app).get("/api/arounds/mine").set("Authorization", alice.auth);
+    expect(mine.status).toBe(200);
+    expect(mine.body.arounds).toHaveLength(1);
+    expect(mine.body.arounds[0].status).toBe("closed");
+    expect(mine.body.arounds[0].center).toBeNull();
+    expect(mine.body.arounds[0].name).toBeNull();
+
+    const detail = await request(app).get(`/api/arounds/${around._id}`).set("Authorization", alice.auth);
+    expect(detail.status).toBe(200);
+    expect(detail.body.around.center).toBeNull();
   });
 
   // User-targeted reports carry aroundId:null, so the per-around purge never

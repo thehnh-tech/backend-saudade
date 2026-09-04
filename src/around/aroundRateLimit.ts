@@ -1,10 +1,14 @@
 import type { NextFunction, Response } from "express";
 import type { AuthedRequest } from "../types.js";
 import { clientIpOf } from "./geoUtils.js";
+import { makeSharedLockout, makeSharedRateLimit } from "./sharedRateLimit.js";
 
 // Sliding-window in-memory rate limiter, same 429 contract as the existing
 // rateLimit.ts ({error:"RATE_LIMITED"} + Retry-After header). In-memory is
-// fine for the documented mono-instance deployment.
+// only a POLITENESS control on the serverless deployment (state multiplies
+// by warm-lambda count and dies on cold start): every limiter that is a
+// SECURITY control is a shared Mongo-backed instance from sharedRateLimit.ts
+// instead — see the instance list at the bottom.
 
 type KeyFn = (req: AuthedRequest) => string;
 
@@ -221,13 +225,19 @@ export const oauthRateLimit = makeRateLimit({
   releaseWhen: (status) => status === 200 || status === 201 || status === 409
 });
 export const locationRateLimit = makeRateLimit({ windowMs: 30 * 1000, max: 1, keyFn: userKey });
-export const joinRateLimit = makeRateLimit({ windowMs: 60 * 1000, max: 5, keyFn: userKey });
-export const createAroundRateLimit = makeRateLimit({ windowMs: 60 * 60 * 1000, max: 3, keyFn: userKey });
 export const uploadPhotoRateLimit = makeRateLimit({ windowMs: 10 * 1000, max: 1, keyFn: userKey });
 export const deletePhotoRateLimit = makeRateLimit({ windowMs: 10 * 1000, max: 3, keyFn: userKey });
 export const reportRateLimit = makeRateLimit({ windowMs: 24 * 60 * 60 * 1000, max: 20, keyFn: userKey });
-export const nearbyRateLimit = makeRateLimit({ windowMs: 60 * 1000, max: 15, keyFn: userKey });
 export const deviceRateLimit = makeRateLimit({ windowMs: 60 * 1000, max: 10, keyFn: userKey });
+
+// SHARED (Mongo-backed) instances: the anti-scan and anti-abuse budgets that
+// an attacker could otherwise multiply by lambda count or reset with a cold
+// start. Fixed windows: the worst-case straddle admits 2x the figure below,
+// still prohibitive for the attacks these bound. Test state is wiped by
+// clearCollections, not by resetAroundRateLimits.
+export const nearbyRateLimit = makeSharedRateLimit({ name: "nearby", windowMs: 60 * 1000, max: 15, keyFn: userKey });
+export const joinRateLimit = makeSharedRateLimit({ name: "join", windowMs: 60 * 1000, max: 5, keyFn: userKey });
+export const createAroundRateLimit = makeSharedRateLimit({ name: "create", windowMs: 60 * 60 * 1000, max: 3, keyFn: userKey });
 
 // E-mail sign-up / sign-in (around/emailAuth.ts).
 //
@@ -247,11 +257,12 @@ export const emailVerifyRateLimit = makeRateLimit({ windowMs: 15 * 60 * 1000, ma
 // keeps their five real sends.
 export const emailResendCooldown = makeRateLimit({ windowMs: 60 * 1000, max: 1, keyFn: emailKey });
 export const emailResendRateLimit = makeRateLimit({ windowMs: 60 * 60 * 1000, max: 5, keyFn: emailKey });
-export const emailLoginRateLimit = makeRateLimit({ windowMs: 15 * 60 * 1000, max: 10, keyFn: ipKey });
+export const emailLoginRateLimit = makeSharedRateLimit({ name: "email-login", windowMs: 15 * 60 * 1000, max: 10, keyFn: ipKey });
 // Password guessing is per-account, so the lockout counts consecutive 401s on
 // the e-mail. 5 in a row => 5 min, doubling to 1 h. A 403 (EMAIL_NOT_VERIFIED,
 // which is only reachable with the RIGHT password) neither arms nor clears it.
-export const emailLoginLockout = makeProgressiveLockout({
+export const emailLoginLockout = makeSharedLockout({
+  name: "email-login",
   keyFn: emailKey,
   threshold: 5,
   baseLockMs: 5 * 60 * 1000,
@@ -264,8 +275,9 @@ export const emailLoginLockout = makeProgressiveLockout({
 // a progressive lockout (5 consecutive 401s => 5 min, doubling up to 1 h).
 // ipKey -> clientIpOf -> req.ip, derived from `trust proxy: 1` (server.ts), so
 // the key cannot be forged with an X-Forwarded-For header.
-export const adminLoginRateLimit = makeRateLimit({ windowMs: 15 * 60 * 1000, max: 5, keyFn: ipKey });
-export const adminLoginLockout = makeProgressiveLockout({
+export const adminLoginRateLimit = makeSharedRateLimit({ name: "admin-login", windowMs: 15 * 60 * 1000, max: 5, keyFn: ipKey });
+export const adminLoginLockout = makeSharedLockout({
+  name: "admin-login",
   keyFn: ipKey,
   threshold: 5,
   baseLockMs: 5 * 60 * 1000,

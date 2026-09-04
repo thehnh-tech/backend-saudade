@@ -105,7 +105,10 @@ export async function exchangeAppleAuthorizationCode(code: string): Promise<stri
     const response = await fetch(APPLE_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString()
+      body: body.toString(),
+      // Awaited inside the sign-in request, whose client aborts at 15 s: a
+      // degraded Apple endpoint must cost seconds, never the whole sign-in.
+      signal: AbortSignal.timeout(5000)
     });
     if (!response.ok) {
       console.warn(`[around:apple] authorization code exchange failed (${response.status})`);

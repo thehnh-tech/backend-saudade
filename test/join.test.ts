@@ -54,6 +54,16 @@ describe("POST /api/arounds/:id/join — double fix verification", () => {
     expect(membership?.status).toBe("active");
     expect(membership?.joinFixes).toHaveLength(2);
     expect(membership?.joinFixes[0].distanceM).toBeGreaterThan(200);
+    // "Position jamais conservée" : the stored audit is derived numbers only —
+    // no raw coordinates, no IP, no geoIP city may ever reach the database.
+    const raw = membership as unknown as Record<string, unknown> & { joinFixes: Record<string, unknown>[] };
+    expect(raw.joinFixes[0]).not.toHaveProperty("lat");
+    expect(raw.joinFixes[0]).not.toHaveProperty("lng");
+    expect(raw.joinFixes[0]).toHaveProperty("accuracy");
+    expect(raw.joinFixes[0]).toHaveProperty("capturedAt");
+    expect(raw).not.toHaveProperty("joinIp");
+    expect(raw).not.toHaveProperty("joinGeo");
+    expect(typeof membership?.interFixDistanceM).toBe("number");
     const updated = await AroundModel.findById(around._id).lean();
     expect(updated?.memberCount).toBe(2);
   });
@@ -169,6 +179,25 @@ describe("POST /api/arounds/:id/join — double fix verification", () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("STALE_FIX");
+  });
+
+  it("keeps the hard GeoIP wall: in-range fixes from a mismatched IP get 403 GEO_MISMATCH", async () => {
+    const owner = await createUser("owner");
+    const around = await createAroundFixture(owner.user._id);
+    const spoofer = await createUser("spoofer");
+
+    // /nearby degrades on this pattern (see nearby.test.ts); /join must NOT —
+    // a join asserts physical presence, and the GeoIP consistency check is
+    // part of the proof. 8.8.8.8 geolocates to the US, ~6500 km from the
+    // Lausanne fixes.
+    const res = await request(app)
+      .post(`/api/arounds/${around._id}/join`)
+      .set("X-Forwarded-For", "8.8.8.8")
+      .set("Authorization", spoofer.auth)
+      .send({ fixes: makeFixes(LAUSANNE.lat, LAUSANNE.lng) });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("GEO_MISMATCH");
+    expect(await AroundMemberModel.countDocuments({ aroundId: around._id, userId: spoofer.user._id })).toBe(0);
   });
 
   it("refuses a kicked user with 403 KICKED", async () => {

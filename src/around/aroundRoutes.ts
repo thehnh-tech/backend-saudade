@@ -3,10 +3,22 @@ import { Types, isValidObjectId } from "mongoose";
 import { z } from "zod";
 import { config } from "../config.js";
 import { createAroundRateLimit, joinRateLimit, nearbyRateLimit, reportRateLimit } from "./aroundRateLimit.js";
-import { clientIpOf, geoIpConsistency, haversineMeters, joinToleranceM, verifyJoinFixes, type JoinFixInput } from "./geoUtils.js";
+import {
+  GEO_IP_MAX_DISTANCE_KM,
+  clientIpOf,
+  displayCenterOffset,
+  geoIpConsistency,
+  haversineMeters,
+  joinToleranceM,
+  offsetPoint,
+  verifyJoinFixes,
+  type JoinFixInput
+} from "./geoUtils.js";
 import { requireUser, wrap, type AroundRequest } from "./middleware.js";
 import { bilateralBlockSet, createReport, sendReportAlertEmail } from "./moderation.js";
 import {
+  AROUND_MAX_RADIUS_M,
+  AROUND_MIN_RADIUS_M,
   AroundMemberModel,
   AroundModel,
   AroundUserModel,
@@ -14,7 +26,8 @@ import {
   geoPoint,
   type Around,
   type AroundMember,
-  type AroundUser
+  type AroundUser,
+  type GeoPoint
 } from "./models.js";
 import { fanOutAroundCreated } from "./push.js";
 import { runDetached } from "./serverless.js";
@@ -28,8 +41,28 @@ const MAX_ACTIVE_AROUNDS_PER_OWNER = 2;
 // reconstruct the center to the meter. 50 m is enough to render a card.
 const NEARBY_DISTANCE_BUCKET_M = 50;
 
-// Same tolerance as the GeoIP consistency check of /join (geoUtils).
-const GEO_IP_MAX_DISTANCE_KM = 1000;
+// One warn per user per window: the 30 s Home poll would otherwise turn a
+// single VPN session into a log torrent. Per warm lambda only — this is
+// noise control, not a security control.
+const GEO_DEGRADED_LOG_WINDOW_MS = 10 * 60 * 1000;
+const geoDegradedLoggedAt = new Map<string, number>();
+
+function warnGeoDegraded(userId: string, ip: string | null, distanceKm: number) {
+  const now = Date.now();
+  if (now - (geoDegradedLoggedAt.get(userId) ?? 0) < GEO_DEGRADED_LOG_WINDOW_MS) return;
+  geoDegradedLoggedAt.set(userId, now);
+  console.warn(
+    `[around:geo-degraded] nearby served despite GeoIP mismatch user=${userId} ip=${ip ?? "unknown"} distanceKm=${Math.round(distanceKm)}`
+  );
+}
+
+// Bucketing alone is invertible: ceil flips exactly on true multiples of
+// 50 m, so three probed flip points reconstruct the centre to the metre.
+// Non-members therefore get their distance measured from a per-around
+// DISPLAY centre (displayCenterOffset in geoUtils.ts, 5–15 m, deterministic):
+// probing converges on that decoy, never on the owner's position. Members
+// keep the exact distance, and every eligibility computation keeps the true
+// centre.
 
 // Must stay in sync with DEMO_PSEUDO in seedReviewAround.ts.
 const REVIEW_DEMO_OWNER_PSEUDO = "pma-demo";
@@ -39,7 +72,7 @@ const createAroundSchema = z.object({
   lat: z.number().min(-90).max(90),
   lng: z.number().min(-180).max(180),
   accuracy: z.number().min(0).max(100000),
-  radiusM: z.number().min(10).max(300),
+  radiusM: z.number().min(AROUND_MIN_RADIUS_M).max(AROUND_MAX_RADIUS_M),
   durationH: z.number().positive().max(48).optional()
 });
 
@@ -157,6 +190,16 @@ export function registerAroundRoutes(app: Express) {
     const captureEndsAt = new Date(now.getTime() + durationMs);
     const expiresAt = new Date(captureEndsAt.getTime() + config.aroundRetentionMs);
 
+    // The auth cache can outlive the account by up to 60 s on another warm
+    // lambda: gated only on the JWT, a create here could re-persist the exact
+    // position of a user whose deletion just erased every around they owned.
+    // Same DB-side gate as POST /api/users/me/location.
+    const alive = await AroundUserModel.updateOne(
+      { _id: user._id, status: "active" },
+      { $set: { lastSeenAt: now } }
+    );
+    if (alive.matchedCount !== 1) return res.status(401).json({ error: "INVALID_TOKEN" });
+
     const created = await AroundModel.create({
       ownerId: user._id,
       name: parsed.data.name ?? null,
@@ -179,15 +222,11 @@ export function registerAroundRoutes(app: Express) {
       role: "owner",
       status: "active",
       joinFixes: [{
-        lat: parsed.data.lat,
-        lng: parsed.data.lng,
         accuracy: parsed.data.accuracy,
         capturedAt: now,
         distanceM: 0
       }],
       interFixDistanceM: null,
-      joinIp: clientIpOf(req),
-      joinGeo: null,
       suspicious: false,
       createdAt: now
     });
@@ -215,14 +254,20 @@ export function registerAroundRoutes(app: Express) {
     const viewerId = String(user._id);
     const bypassGeoChecks = config.devBypassRadius || isReviewModeUser(viewerId);
 
-    // The queried point must be consistent with the caller's IP, exactly like
-    // /join. Without this, /nearby is a geolocation oracle usable from
-    // anywhere: arbitrary coordinates let a scripted client sweep a whole city
-    // and probe third-party arounds it can never reach.
+    // The queried point should be consistent with the caller's IP, like on
+    // /join — but here a mismatch only DEGRADES: geoip is centroid-coarse for
+    // CGNAT, VPNs and overseas carriers (a Réunion IP geolocates to Paris),
+    // and the old hard 403 blanked the radar for those real users on every
+    // 30 s poll. What a sweeping script gains is bounded by what this route
+    // already withholds — 50 m-bucketed distances, no centre for non-members
+    // — plus the 15/min rate limit. /join keeps the wall: physical presence
+    // is the claim there.
+    let geoDegraded = false;
     if (!bypassGeoChecks) {
       const { distanceKm } = geoIpConsistency(clientIpOf(req), lat, lng);
       if (distanceKm !== null && distanceKm > GEO_IP_MAX_DISTANCE_KM) {
-        return res.status(403).json({ error: "GEO_MISMATCH", geoIpDistanceKm: Math.round(distanceKm) });
+        geoDegraded = true;
+        warnGeoDegraded(viewerId, clientIpOf(req), distanceKm);
       }
     }
 
@@ -242,6 +287,9 @@ export function registerAroundRoutes(app: Express) {
     const inRange = candidates.filter((around) => {
       if (blocked.has(String(around.ownerId))) return false;
       if (around.kickedUserIds.some((id) => String(id) === viewerId)) return false;
+      // A centre-less doc is purged/erased and cannot match the geo query;
+      // the guard is for the type, not for a reachable state.
+      if (!around.center) return false;
       const [centerLng, centerLat] = around.center.coordinates;
       const distance = haversineMeters(lat, lng, centerLat, centerLng);
       return distance <= around.radiusM + joinToleranceM(accuracy);
@@ -255,8 +303,13 @@ export function registerAroundRoutes(app: Express) {
       // REVIEW_MODE_USER_IDS is a list of VIEWERS. The demo around belongs to
       // the seeded `pma-demo` account, not to the reviewer, so it has to be
       // resolved server-side — otherwise the review account sees nothing.
+      // Oldest account wins. Public names stopped being unique on 2026-08-30,
+      // and "pma-demo" is a name anyone can register: an unordered findOne
+      // would then be non-deterministic, and could serve a stranger's arounds
+      // to the review account with the geo constraint lifted.
       const demoOwner = await AroundUserModel
         .findOne({ pseudoLower: REVIEW_DEMO_OWNER_PSEUDO })
+        .sort({ createdAt: 1 })
         .lean<AroundUser>();
       if (demoOwner && !ownerIds.some((id) => id.equals(demoOwner._id))) {
         ownerIds.push(demoOwner._id);
@@ -271,7 +324,12 @@ export function registerAroundRoutes(app: Express) {
       }
     }
 
-    const all = [...inRange, ...extra];
+    // The type-predicate filter also covers the review-mode `extra` docs,
+    // which never went through the geo query or inRange's centre guard: an
+    // erased centre must degrade to an absent card, never to a crash.
+    const all = [...inRange, ...extra].filter(
+      (around): around is Around & { center: GeoPoint } => Boolean(around.center)
+    );
     const memberships = await AroundMemberModel.find({
       userId: user._id,
       aroundId: { $in: all.map((around) => around._id) },
@@ -281,19 +339,30 @@ export function registerAroundRoutes(app: Express) {
     const pseudos = await ownerPseudoMap(all);
 
     return res.json({
+      // Additive and only ever true: old clients ignore it, a debugging
+      // session (or a future banner) can read why distances may be off.
+      ...(geoDegraded ? { geoDegraded: true } : {}),
       arounds: all.map((around) => {
         const [centerLng, centerLat] = around.center.coordinates;
         const joined = joinedIds.has(String(around._id));
-        const exactM = haversineMeters(lat, lng, centerLat, centerLng);
         // The exact center AND the exact distance are only disclosed to
-        // members. Non-joined callers get a 50 m band: enough to render the
-        // card, useless as a trilateration oracle.
+        // members. Non-joined callers get a 50 m band measured from the
+        // jittered display centre (see displayCenterOffset): enough to
+        // render the card, useless as a trilateration oracle.
+        let measuredM: number;
+        if (joined) {
+          measuredM = haversineMeters(lat, lng, centerLat, centerLng);
+        } else {
+          const { dLatM, dLngM } = displayCenterOffset(String(around._id));
+          const display = offsetPoint(centerLat, centerLng, dLatM, dLngM);
+          measuredM = haversineMeters(lat, lng, display.lat, display.lng);
+        }
         const { center, ...rest } = aroundResponse(around, {
           viewerId,
           ownerPseudo: pseudos.get(String(around.ownerId)) ?? null,
           distanceM: joined
-            ? Math.round(exactM)
-            : Math.ceil(exactM / NEARBY_DISTANCE_BUCKET_M) * NEARBY_DISTANCE_BUCKET_M
+            ? Math.round(measuredM)
+            : Math.ceil(measuredM / NEARBY_DISTANCE_BUCKET_M) * NEARBY_DISTANCE_BUCKET_M
         });
         return {
           ...rest,
@@ -359,7 +428,13 @@ export function registerAroundRoutes(app: Express) {
     const fixes = parsed.data.fixes as [JoinFixInput, JoinFixInput];
     const reviewBypass = isReviewModeUser(viewerId);
     const bypassGeoChecks = config.devBypassRadius || reviewBypass;
-    const verdict = verifyJoinFixes(around, fixes, { ip: clientIpOf(req), bypassGeoChecks });
+    const center = around.center;
+    if (!center) {
+      // Only purged/owner-erased docs lack a centre, and those were refused
+      // above — but a claim of presence cannot be verified without one.
+      return res.status(404).json({ error: "AROUND_NOT_FOUND" });
+    }
+    const verdict = verifyJoinFixes({ center, radiusM: around.radiusM }, fixes, { ip: clientIpOf(req), bypassGeoChecks });
     if (!verdict.ok) {
       return res.status(verdict.status).json({ error: verdict.error, ...(verdict.details ?? {}) });
     }
@@ -384,8 +459,6 @@ export function registerAroundRoutes(app: Express) {
             status: "active",
             joinFixes: verdict.audit.joinFixes,
             interFixDistanceM: verdict.audit.interFixDistanceM,
-            joinIp: verdict.audit.joinIp,
-            joinGeo: verdict.audit.joinGeo,
             suspicious: verdict.audit.suspicious
           }
         }
@@ -399,8 +472,6 @@ export function registerAroundRoutes(app: Express) {
           status: "active",
           joinFixes: verdict.audit.joinFixes,
           interFixDistanceM: verdict.audit.interFixDistanceM,
-          joinIp: verdict.audit.joinIp,
-          joinGeo: verdict.audit.joinGeo,
           suspicious: verdict.audit.suspicious,
           createdAt: new Date()
         });

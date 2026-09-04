@@ -251,8 +251,17 @@ deviceSchema.index({ expoPushToken: 1 }, { unique: true, sparse: true });
 
 // --- device_presences ------------------------------------------------------
 // One doc per user, upserted. The position is OVERWRITTEN (never a history).
-// TTL on updatedAt garbage-collects stale docs after 1h; effective freshness
-// (30 min) is filtered at query time.
+// TTL on updatedAt garbage-collects stale docs after 1h — the same window as
+// presenceFreshMs, so any doc that still exists is fan-out eligible.
+
+// How a presence reached the server. "background" = the CoreLocation-driven
+// task, "foreground" = the Home poll piggyback, "heartbeat" = the 5-min timer
+// the app runs while the location manager keeps it alive, "probe" = the
+// answer to a silent presence-probe push, "geofence" = an iOS region entry.
+// Only "foreground" is exempt from the arrival ring (the user is looking at
+// the list). "significant-change" is legacy-only (kept so old docs still read).
+export const PRESENCE_SOURCES = ["background", "foreground", "heartbeat", "probe", "geofence"] as const;
+export type PresenceSource = (typeof PRESENCE_SOURCES)[number];
 
 export type DevicePresence = {
   _id: Types.ObjectId;
@@ -261,7 +270,10 @@ export type DevicePresence = {
   accuracy: number;
   capturedAt: Date;
   updatedAt: Date;
-  source: "significant-change" | "foreground";
+  source: "significant-change" | PresenceSource;
+  // The installation that last wrote this presence (diagnostics only: the
+  // fan-out still pushes to every device of the account).
+  installationId?: string | null;
 };
 
 const presenceSchema = new Schema<DevicePresence>({
@@ -270,7 +282,8 @@ const presenceSchema = new Schema<DevicePresence>({
   accuracy: { type: Number, required: true },
   capturedAt: { type: Date, required: true },
   updatedAt: { type: Date, required: true, default: () => new Date() },
-  source: { type: String, enum: ["significant-change", "foreground"], required: true, default: "foreground" }
+  source: { type: String, enum: ["significant-change", ...PRESENCE_SOURCES], required: true, default: "foreground" },
+  installationId: { type: String, default: null }
 });
 
 presenceSchema.index({ userId: 1 }, { unique: true });
@@ -281,11 +294,21 @@ presenceSchema.index({ updatedAt: 1 }, { expireAfterSeconds: 60 * 60 });
 
 export type AroundStatus = "active" | "closed" | "purging" | "purged";
 
+// The radius bounds of an around, in metres. The single source of truth: the
+// create schema validates against them (aroundRoutes.ts) and the arrival ring
+// sizes its pre-filter from the maximum (push.ts) — raising the ceiling here
+// used to leave larger arounds silently out of the ring's reach.
+export const AROUND_MIN_RADIUS_M = 10;
+export const AROUND_MAX_RADIUS_M = 300;
+
 export type Around = {
   _id: Types.ObjectId;
   ownerId: Types.ObjectId;
   name?: string | null;
-  center: GeoPoint;
+  // Absent once purged or once the owner deleted their account: the centre is
+  // the owner's exact position and does not survive the erasure. Every active
+  // around carries it.
+  center?: GeoPoint;
   radiusM: number;
   captureWindowMs: number;
   status: AroundStatus;
@@ -303,8 +326,8 @@ export type Around = {
 const aroundSchema = new Schema<Around>({
   ownerId: { type: Schema.Types.ObjectId, required: true, index: true },
   name: { type: String, default: null, trim: true },
-  center: { type: pointSchema, required: true },
-  radiusM: { type: Number, required: true, min: 10, max: 300 },
+  center: { type: pointSchema, required: false },
+  radiusM: { type: Number, required: true, min: AROUND_MIN_RADIUS_M, max: AROUND_MAX_RADIUS_M },
   captureWindowMs: { type: Number, required: true },
   status: { type: String, enum: ["active", "closed", "purging", "purged"], required: true, default: "active" },
   createdAt: { type: Date, required: true, default: () => new Date() },
@@ -324,9 +347,10 @@ aroundSchema.index({ status: 1, expiresAt: 1 });
 
 // --- around_members --------------------------------------------------------
 
+// Derived audit only, NEVER a position: the raw lat/lng are consumed by
+// verifyJoinFixes inside the request and must not be persisted — the app
+// promises "position jamais conservée", and nothing reads them afterwards.
 export type JoinFix = {
-  lat: number;
-  lng: number;
   accuracy: number;
   capturedAt: Date;
   distanceM: number;
@@ -340,8 +364,6 @@ export type AroundMember = {
   status: "active" | "left" | "removed";
   joinFixes: JoinFix[];
   interFixDistanceM?: number | null;
-  joinIp?: string | null;
-  joinGeo?: Record<string, unknown> | null;
   suspicious: boolean;
   anonymizedAt?: Date | null;
   // Monotonic counter of photos this member ever uploaded to this around. It
@@ -353,8 +375,6 @@ export type AroundMember = {
 };
 
 const joinFixSchema = new Schema<JoinFix>({
-  lat: { type: Number, required: true },
-  lng: { type: Number, required: true },
   accuracy: { type: Number, required: true },
   capturedAt: { type: Date, required: true },
   distanceM: { type: Number, required: true }
@@ -367,8 +387,6 @@ const memberSchema = new Schema<AroundMember>({
   status: { type: String, enum: ["active", "left", "removed"], required: true, default: "active" },
   joinFixes: { type: [joinFixSchema], required: true, default: [] },
   interFixDistanceM: { type: Number, default: null },
-  joinIp: { type: String, default: null },
-  joinGeo: { type: Schema.Types.Mixed, default: null },
   suspicious: { type: Boolean, required: true, default: false },
   anonymizedAt: { type: Date, default: null },
   // `default: 0` covers the documents created before this field existed: no
@@ -442,6 +460,43 @@ const photoSchema = new Schema<AroundPhoto>({
 photoSchema.index({ aroundId: 1, uploaderId: 1 });
 photoSchema.index({ aroundId: 1, _id: -1 });
 
+// --- around_rings ----------------------------------------------------------
+// One document per (around, user) that has been RUNG — by the creation fan-out
+// or by the arrival ring on a later presence update. The unique index is the
+// idempotency claim: whichever path claims first sends, every other path (a
+// second lambda, a probe answer, a geofence entry) finds the document and
+// stays silent. Ids only, never a position. TTL 8 days (6 h window + 7 days
+// of retention); purgeAround deletes them with the around.
+
+export const RING_KINDS = ["created", "arrival"] as const;
+export type RingKind = (typeof RING_KINDS)[number];
+
+export type AroundRing = {
+  _id: Types.ObjectId;
+  aroundId: Types.ObjectId;
+  userId: Types.ObjectId;
+  kind: RingKind;
+  // Which presence source triggered an arrival ring (diagnostics).
+  source?: string | null;
+  claimedAt: Date;
+  sentAt?: Date | null;
+  ticketIds: string[];
+};
+
+const ringSchema = new Schema<AroundRing>({
+  aroundId: { type: Schema.Types.ObjectId, required: true },
+  userId: { type: Schema.Types.ObjectId, required: true },
+  kind: { type: String, enum: [...RING_KINDS], required: true },
+  source: { type: String, default: null },
+  claimedAt: { type: Date, required: true, default: () => new Date() },
+  sentAt: { type: Date, default: null },
+  ticketIds: { type: [String], required: true, default: [] }
+});
+
+ringSchema.index({ aroundId: 1, userId: 1 }, { unique: true });
+ringSchema.index({ userId: 1, claimedAt: -1 });
+ringSchema.index({ claimedAt: 1 }, { expireAfterSeconds: 8 * 24 * 60 * 60 });
+
 // --- push_receipts (TTL 7d) ------------------------------------------------
 
 export type PushReceipt = {
@@ -462,6 +517,35 @@ const pushReceiptSchema = new Schema<PushReceipt>({
 });
 
 pushReceiptSchema.index({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 });
+
+// --- rate_limit_counters ---------------------------------------------------
+// Shared fixed-window counters and progressive lockouts (sharedRateLimit.ts):
+// on the serverless deployment the in-memory limiters multiply by the number
+// of warm lambdas, so the security-relevant ones live here instead. The
+// string _id IS the key — "<limiter>:<key>:<windowStart>" for windows,
+// "lock:<limiter>:<key>" for lockouts. The TTL index is garbage collection
+// only: correctness never depends on reaping (the window start is in the
+// key, and the lockout decay is re-checked at read).
+
+export type RateLimitCounter = {
+  _id: string;
+  count?: number;
+  failures?: number;
+  lockedUntil?: Date | null;
+  lastFailureAt?: Date | null;
+  expiresAt: Date;
+};
+
+const rateLimitCounterSchema = new Schema<RateLimitCounter>({
+  _id: { type: String, required: true },
+  count: { type: Number },
+  failures: { type: Number },
+  lockedUntil: { type: Date, default: null },
+  lastFailureAt: { type: Date, default: null },
+  expiresAt: { type: Date, required: true }
+});
+
+rateLimitCounterSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 // --- reports ---------------------------------------------------------------
 
@@ -558,7 +642,9 @@ export const DevicePresenceModel = mongoose.model<DevicePresence>("AroundDeviceP
 export const AroundModel = mongoose.model<Around>("Around", aroundSchema, "arounds");
 export const AroundMemberModel = mongoose.model<AroundMember>("AroundMember", memberSchema, "around_members");
 export const AroundPhotoModel = mongoose.model<AroundPhoto>("AroundPhoto", photoSchema, "around_photos");
+export const AroundRingModel = mongoose.model<AroundRing>("AroundRing", ringSchema, "around_rings");
 export const PushReceiptModel = mongoose.model<PushReceipt>("AroundPushReceipt", pushReceiptSchema, "push_receipts");
+export const RateLimitCounterModel = mongoose.model<RateLimitCounter>("AroundRateLimitCounter", rateLimitCounterSchema, "rate_limit_counters");
 export const AroundReportModel = mongoose.model<AroundReport>("AroundReport", reportSchema, "reports");
 export const AroundBlockModel = mongoose.model<AroundBlock>("AroundBlock", blockSchema, "blocks");
 export const ModerationActionModel = mongoose.model<ModerationAction>("AroundModerationAction", moderationActionSchema, "moderation_actions");
@@ -574,7 +660,9 @@ export async function syncAroundIndexes() {
     AroundModel.syncIndexes(),
     AroundMemberModel.syncIndexes(),
     AroundPhotoModel.syncIndexes(),
+    AroundRingModel.syncIndexes(),
     PushReceiptModel.syncIndexes(),
+    RateLimitCounterModel.syncIndexes(),
     AroundReportModel.syncIndexes(),
     AroundBlockModel.syncIndexes(),
     ModerationActionModel.syncIndexes()

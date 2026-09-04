@@ -1,8 +1,32 @@
 import type { NextFunction, Response } from "express";
 import { isValidObjectId } from "mongoose";
-import { requireRole } from "../auth.js";
+import { requireRole, signAuth } from "../auth.js";
+import { config } from "../config.js";
 import type { AuthedRequest } from "../types.js";
 import { AroundUserModel, type Around, type AroundMember, type AroundUser } from "./models.js";
+
+// Header carrying a renewed session token (see maybeRenewSession). Exposed to
+// browsers via CORS in server.ts; the mobile fetch reads it directly.
+export const SESSION_TOKEN_HEADER = "X-Session-Token";
+
+// Sliding session. A 7-day token that is never renewed kills the background
+// radar one week after sign-in: the task keeps POSTing 401s, and the next
+// foreground request signs the user out. Any authenticated request made with
+// a token older than sessionRenewAfterMs answers with a fresh 7-day token in
+// the SESSION_TOKEN_HEADER; the client persists it (the old one stays valid
+// until its own expiry, so a lost header is harmless). The lineage — the
+// sign-in the chain descends from, `sat` — is capped at sessionMaxLineageMs,
+// after which a real sign-in is required again. Tokens signed before v1.1
+// carry no `sat`: their `iat` starts the lineage.
+export function maybeRenewSession(req: AuthedRequest, res: Response) {
+  const auth = req.auth;
+  if (!auth?.userId || typeof auth.iat !== "number") return;
+  const nowS = Math.floor(Date.now() / 1000);
+  if ((nowS - auth.iat) * 1000 < config.sessionRenewAfterMs) return;
+  const sat = typeof auth.sat === "number" ? auth.sat : auth.iat;
+  if ((nowS - sat) * 1000 > config.sessionMaxLineageMs) return;
+  res.setHeader(SESSION_TOKEN_HEADER, signAuth({ role: "user", userId: auth.userId, sat }));
+}
 
 export type AroundRequest = AuthedRequest & {
   user?: AroundUser;
@@ -61,6 +85,7 @@ export function requireUser(req: AroundRequest, res: Response, next: NextFunctio
         if (!user) return res.status(401).json({ error: "INVALID_TOKEN" });
         if (user.status === "banned") return res.status(403).json({ error: "USER_BANNED" });
         req.user = user;
+        maybeRenewSession(req, res);
         return next();
       } catch (error) {
         return next(error);
