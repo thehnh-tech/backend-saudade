@@ -5,11 +5,16 @@ import { uploadImageBuffer } from "./cloudinary.js";
 import { connectDb, GarmentModel } from "./db.js";
 import { nowIso, safeRandomId } from "./utils.js";
 
+const clientPassword = process.env.SEED_CLIENT_PASSWORD;
+if (!clientPassword) {
+  throw new Error("Set SEED_CLIENT_PASSWORD before running the seed command.");
+}
+
 await connectDb();
 
 const publicToken = safeRandomId("qr", 18);
 const clientId = safeRandomId("client", 9);
-const clientPassword = "REMOVED_USE_ENVIRONMENT";
+
 const clientPasswordHash = await bcrypt.hash(clientPassword, 10);
 const captureUrl = `${config.webPublicUrl}/capture/${publicToken}`;
 const qrBuffer = await QRCode.toBuffer(captureUrl, { margin: 2, width: 900, type: "png" });
@@ -28,5 +33,5 @@ await GarmentModel.create({
   createdAt: nowIso()
 });
 
-console.log(JSON.stringify({ publicToken, captureUrl, clientId, clientPassword }, null, 2));
+console.log(JSON.stringify({ publicToken, captureUrl, clientId }, null, 2));
 process.exit(0);
